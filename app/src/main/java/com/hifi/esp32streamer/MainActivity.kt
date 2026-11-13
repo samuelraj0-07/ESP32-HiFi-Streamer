@@ -27,7 +27,7 @@ import kotlin.math.*
 object StreamState {
     @Volatile var isRunning = false
     @Volatile var statusText = "IDLE - Auto-Max Hi-Res Engine Ready"
-    @Volatile var sampleRate = 96000
+    @Volatile var sampleRate = 48000
     @Volatile var nativeMixerRate = 48000
     @Volatile var detectedSourceRate = "Auto-Detecting..."
     @Volatile var activeBitCount = 0
@@ -459,7 +459,7 @@ class AudioCaptureService : Service() {
             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
             .build()
 
-        val candidateRates = intArrayOf(96000, 48000, 44100)
+        val candidateRates = intArrayOf(48000, 44100)
         var lockedRate = 48000
 
         for (rate in candidateRates) {
