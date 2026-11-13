@@ -12,6 +12,7 @@ import android.media.projection.MediaProjectionManager
 import android.net.*
 import android.os.*
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
@@ -56,6 +57,30 @@ object StreamState {
     @Volatile var espIp = "192.168.4.1"
     @Volatile var espPort = 8888
     @Volatile var muteSpeaker = false
+    @Volatile var savedVolumeBeforeMute = -1
+
+    fun enforceSpeakerMuteLock(am: AudioManager) {
+        if (muteSpeaker) {
+            val currentVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (currentVol > 0 && savedVolumeBeforeMute == -1) {
+                savedVolumeBeforeMute = currentVol
+            }
+            if (!am.isStreamMute(AudioManager.STREAM_MUSIC)) {
+                am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+            }
+            if (am.getStreamVolume(AudioManager.STREAM_MUSIC) != 0) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+            }
+        }
+    }
+
+    fun releaseSpeakerMuteLock(am: AudioManager) {
+        am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+        if (savedVolumeBeforeMute > 0) {
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, savedVolumeBeforeMute, 0)
+            savedVolumeBeforeMute = -1
+        }
+    }
 }
 
 // ================================================================================
@@ -279,8 +304,6 @@ class DualAnalogVuMeterView(context: Context) : View(context) {
             pivotY + arcRadius
         )
 
-        // In Android Canvas: -90 deg is straight UP (12 o'clock).
-        // Leftmost (-48 deg) = -138 deg; 0 VU (+20 deg) = -70 deg; Rightmost (+48 deg) = -42 deg.
         scaleBlackPaint.strokeWidth = 3.2f
         scaleRedPaint.strokeWidth = 5.0f
         canvas.drawArc(arcRect, -138f, 68f, false, scaleBlackPaint) // -20 to 0 VU
@@ -368,7 +391,6 @@ class DualAnalogVuMeterView(context: Context) : View(context) {
         val tipX = pivotX + nLen * cos(needleRad).toFloat()
         val tipY = pivotY + nLen * sin(needleRad).toFloat()
 
-        // Shadow offset slightly right/down
         canvas.drawLine(pivotX + 4f, pivotY + 4f, tipX + 4f, tipY + 4f, needleShadowPaint)
         canvas.drawLine(pivotX, pivotY, tipX, tipY, needlePaint)
 
@@ -390,6 +412,7 @@ class DualAnalogVuMeterView(context: Context) : View(context) {
 class MainActivity : AppCompatActivity() {
 
     private lateinit var projectionManager: MediaProjectionManager
+    private lateinit var audioManager: AudioManager
     private val uiHandler = Handler(Looper.getMainLooper())
 
     private lateinit var vuMeterView: DualAnalogVuMeterView
@@ -453,12 +476,27 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         StreamState.nativeMixerRate = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull() ?: 48000
 
         buildDashboardUi()
         requestNeededPermissions()
+    }
+
+    // LAYER 1 MUTE LOCK: Intercept physical Volume Up/Down keys when Mute Speaker switch is ON
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (StreamState.muteSpeaker && (
+                event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+                event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
+                event.keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
+            )) {
+            StreamState.enforceSpeakerMuteLock(audioManager)
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                Toast.makeText(this, "Phone Speaker Locked Muted (Uncheck Mute switch to change volume)", Toast.LENGTH_SHORT).show()
+            }
+            return true // Swallow hardware volume key so Android cannot unmute speaker!
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     private fun buildDashboardUi() {
@@ -538,18 +576,18 @@ class MainActivity : AppCompatActivity() {
 
         // Switches
         swMute = Switch(this).apply {
-            text = "Mute Phone Speaker (Keep OFF for 100% Bit-Perfect 0dBFS Test)"
+            text = "Mute Phone Speaker (Locked Even If Volume Up Pressed)"
             setTextColor(Color.WHITE)
             textSize = 13f
+            isChecked = StreamState.muteSpeaker
             setPadding(0, 24, 0, 12)
             setOnCheckedChangeListener { _, isChecked ->
                 StreamState.muteSpeaker = isChecked
-                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                am.adjustStreamVolume(
-                    AudioManager.STREAM_MUSIC,
-                    if (isChecked) AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE,
-                    0
-                )
+                if (isChecked) {
+                    StreamState.enforceSpeakerMuteLock(audioManager)
+                } else {
+                    StreamState.releaseSpeakerMuteLock(audioManager)
+                }
             }
         }
         root.addView(swMute)
@@ -558,6 +596,7 @@ class MainActivity : AppCompatActivity() {
             text = "Stream 24-Bit PCM to ESP32 Wi-Fi (Keep OFF for Local Test)"
             setTextColor(Color.parseColor("#81D4FA"))
             textSize = 13f
+            isChecked = StreamState.streamToEsp32
             setPadding(0, 8, 0, 16)
             setOnCheckedChangeListener { _, isChecked ->
                 StreamState.streamToEsp32 = isChecked
@@ -698,7 +737,7 @@ class MainActivity : AppCompatActivity() {
 }
 
 // ================================================================================
-// BACKGROUND ENGINE: Auto-Max 48kHz Lock + 24-Bit Histogram + FFT Analyzer
+// BACKGROUND ENGINE: Auto-Max 48kHz Lock + 24-Bit Histogram + FFT + Mute Lock
 // ================================================================================
 class AudioCaptureService : Service() {
 
@@ -706,6 +745,15 @@ class AudioCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var captureThread: Thread? = null
     private lateinit var audioManager: AudioManager
+
+    // LAYER 2 MUTE LOCK: System-wide BroadcastReceiver catches Volume Up/Down even inside Apple Music!
+    private val volumeLockReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (StreamState.muteSpeaker) {
+                StreamState.enforceSpeakerMuteLock(audioManager)
+            }
+        }
+    }
 
     private val playbackCallback = object : AudioManager.AudioPlaybackCallback() {
         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
@@ -731,6 +779,13 @@ class AudioCaptureService : Service() {
         super.onCreate()
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         audioManager.registerAudioPlaybackCallback(playbackCallback, null)
+
+        val filter = IntentFilter("android.media.VOLUME_CHANGED_ACTION")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(volumeLockReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(volumeLockReceiver, filter)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -827,6 +882,10 @@ class AudioCaptureService : Service() {
             return
         }
 
+        if (StreamState.muteSpeaker) {
+            StreamState.enforceSpeakerMuteLock(audioManager)
+        }
+
         StreamState.sampleRate = lockedRate
         audioRecord?.startRecording()
         StreamState.isRunning = true
@@ -843,6 +902,11 @@ class AudioCaptureService : Service() {
             var outStream: OutputStream? = null
 
             while (StreamState.isRunning) {
+                // LAYER 3 MUTE LOCK: Continuously enforce speaker mute in real-time audio loop
+                if (StreamState.muteSpeaker) {
+                    StreamState.enforceSpeakerMuteLock(audioManager)
+                }
+
                 val readCount = audioRecord?.read(floatSamples, 0, floatSamples.size, AudioRecord.READ_BLOCKING) ?: 0
                 if (readCount <= 0) continue
 
@@ -1104,7 +1168,7 @@ class AudioCaptureService : Service() {
         try { mediaProjection?.stop() } catch (_: Exception) {}
         mediaProjection = null
 
-        audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+        StreamState.releaseSpeakerMuteLock(audioManager)
         StreamState.leftDb = -50f
         StreamState.rightDb = -50f
         StreamState.leftPeak = false
@@ -1115,6 +1179,7 @@ class AudioCaptureService : Service() {
     }
 
     override fun onDestroy() {
+        try { unregisterReceiver(volumeLockReceiver) } catch (_: Exception) {}
         audioManager.unregisterAudioPlaybackCallback(playbackCallback)
         cleanupAndStop()
         super.onDestroy()
