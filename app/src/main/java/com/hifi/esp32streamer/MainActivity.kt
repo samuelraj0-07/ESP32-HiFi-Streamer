@@ -5,14 +5,14 @@ import android.app.*
 import android.content.*
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.Color
-import android.graphics.Typeface
+import android.graphics.*
 import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.*
 import android.os.*
 import android.view.Gravity
+import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -35,6 +35,10 @@ object StreamState {
     @Volatile var qualityVerdict = "Waiting for music playback..."
     @Volatile var leftLevel = 0
     @Volatile var rightLevel = 0
+    @Volatile var leftDb = -40f
+    @Volatile var rightDb = -40f
+    @Volatile var leftPeak = false
+    @Volatile var rightPeak = false
     @Volatile var dbFs = -100.0
     @Volatile var crestFactorDb = 0.0
     @Volatile var dataRateKbps = 0.0
@@ -54,20 +58,347 @@ object StreamState {
     @Volatile var muteSpeaker = false
 }
 
+// ================================================================================
+// CUSTOM ILLUMINATED VINTAGE ANALOG STEREO VU METER VIEW (LEFT & RIGHT DIALS)
+// ================================================================================
+class DualAnalogVuMeterView(context: Context) : View(context) {
+
+    private var smoothAngleL = -48f
+    private var smoothAngleR = -48f
+
+    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#141414") }
+    private val bezelOuterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#2C2C2C")
+        style = Paint.Style.FILL
+    }
+    private val bezelInnerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#0D0D0D")
+        style = Paint.Style.STROKE
+        strokeWidth = 5f
+    }
+    private val dialFacePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val scaleBlackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#2B1B0E")
+        style = Paint.Style.STROKE
+        strokeWidth = 3.5f
+    }
+    private val scaleRedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#D50000")
+        style = Paint.Style.STROKE
+        strokeWidth = 4.5f
+    }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#2B1B0E")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.SERIF, Typeface.BOLD)
+    }
+    private val redTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#D50000")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.SERIF, Typeface.BOLD)
+    }
+    private val vuTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#23150A")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+    }
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#BDBDBD")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
+    }
+    private val peakTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#E53935")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+    }
+    private val needleShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(85, 0, 0, 0)
+        style = Paint.Style.STROKE
+        strokeWidth = 4.5f
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val needlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1A1A1A")
+        style = Paint.Style.STROKE
+        strokeWidth = 3.5f
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val pivotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#424242")
+        style = Paint.Style.FILL
+    }
+    private val ledPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    // Maps dBFS (-40..0 dB) to VU needle angle (-48 deg to +48 deg, where 0 VU = +20 deg)
+    private fun dbToAngle(db: Float): Float {
+        // Shift dBFS so typical -14 dBFS RMS sits around 0 VU, peaking up to +6 VU
+        val vu = (db + 10f).coerceIn(-25f, 6f)
+        val norm = when {
+            vu <= -20f -> (vu + 25f) / 5f * 0.08f
+            vu <= -10f -> 0.08f + (vu + 20f) / 10f * 0.18f
+            vu <= -3f  -> 0.26f + (vu + 10f) / 7f * 0.26f
+            vu <= 0f   -> 0.52f + (vu + 3f) / 3f * 0.19f
+            else       -> 0.71f + (vu / 6f) * 0.29f
+        }.coerceIn(0f, 1f)
+        return -48f + norm * 96f
+    }
+
+    fun updateMeters() {
+        val targetL = if (StreamState.isRunning) dbToAngle(StreamState.leftDb) else -48f
+        val targetR = if (StreamState.isRunning) dbToAngle(StreamState.rightDb) else -48f
+
+        // Analog VU ballistics: Fast attack (0.45), smooth natural decay (0.18)
+        smoothAngleL += if (targetL > smoothAngleL) (targetL - smoothAngleL) * 0.45f else (targetL - smoothAngleL) * 0.18f
+        smoothAngleR += if (targetR > smoothAngleR) (targetR - smoothAngleR) * 0.45f else (targetR - smoothAngleR) * 0.18f
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+
+        // Outer Dark Console Chassis
+        canvas.drawRoundRect(0f, 0f, w, h, 22f, 22f, bgPaint)
+
+        val pad = w * 0.025f
+        val meterW = (w - pad * 3f) / 2f
+        val topHeader = h * 0.18f
+        val bottomFooter = h * 0.16f
+        val meterH = h - topHeader - bottomFooter
+
+        // Draw LEFT and RIGHT Illuminated VU Meters
+        drawSingleVuMeter(
+            canvas,
+            left = pad,
+            top = topHeader,
+            mw = meterW,
+            mh = meterH,
+            needleAngleDeg = smoothAngleL,
+            isPeak = StreamState.leftPeak,
+            channelLabel = "LEFT"
+        )
+
+        drawSingleVuMeter(
+            canvas,
+            left = pad * 2f + meterW,
+            top = topHeader,
+            mw = meterW,
+            mh = meterH,
+            needleAngleDeg = smoothAngleR,
+            isPeak = StreamState.rightPeak,
+            channelLabel = "RIGHT"
+        )
+
+        // Center calibration screw decoration between LEFT and RIGHT
+        val cx = w / 2f
+        val cy = h - bottomFooter * 0.5f
+        pivotPaint.color = Color.parseColor("#373737")
+        canvas.drawCircle(cx, cy, 14f, pivotPaint)
+        scaleBlackPaint.color = Color.parseColor("#9E9E9E")
+        scaleBlackPaint.strokeWidth = 2f
+        canvas.drawLine(cx - 8f, cy - 6f, cx + 8f, cy + 6f, scaleBlackPaint)
+        scaleBlackPaint.color = Color.parseColor("#2B1B0E")
+    }
+
+    private fun drawSingleVuMeter(
+        canvas: Canvas,
+        left: Float,
+        top: Float,
+        mw: Float,
+        mh: Float,
+        needleAngleDeg: Float,
+        isPeak: Boolean,
+        channelLabel: String
+    ) {
+        val cx = left + mw / 2f
+
+        // 1. Draw Red "Peak" LED Lamp + Label at Top
+        val ledY = top * 0.35f
+        val ledRadius = (mw * 0.032f).coerceIn(7f, 14f)
+        if (isPeak) {
+            ledPaint.shader = RadialGradient(
+                cx, ledY, ledRadius * 2.2f,
+                intArrayOf(Color.parseColor("#FF8A80"), Color.parseColor("#FF1744"), Color.TRANSPARENT),
+                floatArrayOf(0f, 0.55f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            canvas.drawCircle(cx, ledY, ledRadius * 2.2f, ledPaint)
+        } else {
+            ledPaint.shader = RadialGradient(
+                cx - 2f, ledY - 2f, ledRadius,
+                Color.parseColor("#8E3A3A"), Color.parseColor("#3E1212"),
+                Shader.TileMode.CLAMP
+            )
+            canvas.drawCircle(cx, ledY, ledRadius, ledPaint)
+        }
+        peakTextPaint.textSize = (mw * 0.068f).coerceIn(16f, 28f)
+        canvas.drawText("Peak", cx, top * 0.82f, peakTextPaint)
+
+        // 2. Draw Outer Metallic Bezel
+        val bezelRect = RectF(left, top, left + mw, top + mh)
+        canvas.drawRoundRect(bezelRect, 10f, 10f, bezelOuterPaint)
+
+        val faceInset = mw * 0.045f
+        val faceRect = RectF(
+            left + faceInset,
+            top + faceInset,
+            left + mw - faceInset,
+            top + mh - faceInset
+        )
+
+        // 3. Warm Amber / Yellow Illuminated Backlight Gradient
+        dialFacePaint.shader = RadialGradient(
+            cx,
+            faceRect.bottom - faceRect.height() * 0.15f,
+            faceRect.width() * 0.72f,
+            intArrayOf(
+                Color.parseColor("#FFF3B0"), // Bright warm bulb center
+                Color.parseColor("#FFB300"), // Classic amber mid
+                Color.parseColor("#E67E00")  // Deep vintage orange edge
+            ),
+            floatArrayOf(0f, 0.58f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(faceRect, dialFacePaint)
+        canvas.drawRect(faceRect, bezelInnerPaint)
+
+        // 4. Pivot Point (Below the bottom edge of the window) & Scale Arcs
+        val pivotX = cx
+        val pivotY = faceRect.bottom + faceRect.height() * 0.22f
+        val arcRadius = faceRect.height() * 0.86f
+
+        canvas.save()
+        canvas.clipRect(faceRect)
+
+        val arcRect = RectF(
+            pivotX - arcRadius,
+            pivotY - arcRadius,
+            pivotX + arcRadius,
+            pivotY + arcRadius
+        )
+
+        // In Android Canvas: -90 deg is straight UP (12 o'clock).
+        // Leftmost (-48 deg) = -138 deg; 0 VU (+20 deg) = -70 deg; Rightmost (+48 deg) = -42 deg.
+        scaleBlackPaint.strokeWidth = 3.2f
+        scaleRedPaint.strokeWidth = 5.0f
+        canvas.drawArc(arcRect, -138f, 68f, false, scaleBlackPaint) // -20 to 0 VU
+        canvas.drawArc(arcRect, -70f, 28f, false, scaleRedPaint)    // 0 to +6 VU Red Zone
+
+        // Inner secondary sub-arc for % modulation
+        val innerRadius = arcRadius * 0.92f
+        val innerArcRect = RectF(
+            pivotX - innerRadius,
+            pivotY - innerRadius,
+            pivotX + innerRadius,
+            pivotY + innerRadius
+        )
+        scaleBlackPaint.strokeWidth = 1.8f
+        canvas.drawArc(innerArcRect, -138f, 68f, false, scaleBlackPaint)
+
+        // 5. Tick Marks & Numbers (-20, -10, -7, -5, -3, -1, 0, +3, +6)
+        data class Tick(val norm: Float, val label: String, val isRed: Boolean, val subPct: String? = null)
+        val ticks = listOf(
+            Tick(0.04f, "-", false, "%"),
+            Tick(0.10f, "20", false, "20"),
+            Tick(0.26f, "10", false, "40"),
+            Tick(0.37f, "7", false, "60"),
+            Tick(0.45f, "5", false),
+            Tick(0.53f, "3", false, "80"),
+            Tick(0.64f, "1", false),
+            Tick(0.71f, "0", true, "100"),
+            Tick(0.85f, "3", true),
+            Tick(0.97f, "6", true, "+")
+        )
+
+        textPaint.textSize = (mw * 0.052f).coerceIn(11f, 22f)
+        redTextPaint.textSize = textPaint.textSize
+        val subTextSize = textPaint.textSize * 0.82f
+
+        for (t in ticks) {
+            val degFromUp = -48f + t.norm * 96f
+            val rad = Math.toRadians((degFromUp - 90f).toDouble())
+            val cosA = cos(rad).toFloat()
+            val sinA = sin(rad).toFloat()
+
+            val rOuter = arcRadius * 1.09f
+            val rInner = arcRadius * 0.99f
+            val rText = arcRadius * 1.19f
+
+            val pTick = if (t.isRed) scaleRedPaint else scaleBlackPaint
+            pTick.strokeWidth = if (t.label == "0") 4f else 2.5f
+            canvas.drawLine(
+                pivotX + rInner * cosA, pivotY + rInner * sinA,
+                pivotX + rOuter * cosA, pivotY + rOuter * sinA,
+                pTick
+            )
+
+            val pTxt = if (t.isRed) redTextPaint else textPaint
+            pTxt.textSize = (mw * 0.052f).coerceIn(11f, 22f)
+            canvas.drawText(
+                t.label,
+                pivotX + rText * cosA,
+                pivotY + rText * sinA + pTxt.textSize * 0.35f,
+                pTxt
+            )
+
+            if (t.subPct != null) {
+                val rSub = arcRadius * 0.81f
+                textPaint.textSize = subTextSize
+                canvas.drawText(
+                    t.subPct,
+                    pivotX + rSub * cosA,
+                    pivotY + rSub * sinA + subTextSize * 0.35f,
+                    textPaint
+                )
+            }
+        }
+
+        // 6. "VU" & "DECIBEL POWER LEVEL" Faceplate Text
+        vuTitlePaint.textSize = (mw * 0.088f).coerceIn(18f, 34f)
+        canvas.drawText("VU", cx, faceRect.top + faceRect.height() * 0.72f, vuTitlePaint)
+
+        vuTitlePaint.textSize = (mw * 0.038f).coerceIn(9f, 15f)
+        canvas.drawText("DECIBEL POWER LEVEL", cx, faceRect.top + faceRect.height() * 0.84f, vuTitlePaint)
+
+        // 7. Draw Swinging Needle + Drop Shadow
+        val needleRad = Math.toRadians((needleAngleDeg - 90f).toDouble())
+        val nLen = arcRadius * 1.14f
+        val tipX = pivotX + nLen * cos(needleRad).toFloat()
+        val tipY = pivotY + nLen * sin(needleRad).toFloat()
+
+        // Shadow offset slightly right/down
+        canvas.drawLine(pivotX + 4f, pivotY + 4f, tipX + 4f, tipY + 4f, needleShadowPaint)
+        canvas.drawLine(pivotX, pivotY, tipX, tipY, needlePaint)
+
+        // Bottom Pivot Cap
+        pivotPaint.color = Color.parseColor("#2B2B2B")
+        canvas.drawCircle(pivotX, faceRect.bottom + faceRect.height() * 0.04f, mw * 0.07f, pivotPaint)
+
+        canvas.restore()
+
+        // 8. "LEFT" / "RIGHT" Console Legend Below Meter
+        labelPaint.textSize = (mw * 0.075f).coerceIn(18f, 30f)
+        canvas.drawText(channelLabel, cx, top + mh + (height - (top + mh)) * 0.68f, labelPaint)
+    }
+}
+
+// ================================================================================
+// MAIN ACTIVITY
+// ================================================================================
 class MainActivity : AppCompatActivity() {
 
     private lateinit var projectionManager: MediaProjectionManager
     private val uiHandler = Handler(Looper.getMainLooper())
 
+    private lateinit var vuMeterView: DualAnalogVuMeterView
     private lateinit var tvStatus: TextView
     private lateinit var tvVerdict: TextView
     private lateinit var tvFormatInfo: TextView
     private lateinit var tvBitHistogram: TextView
     private lateinit var tvHex: TextView
     private lateinit var tvDb: TextView
-
-    private lateinit var pbLeft: ProgressBar
-    private lateinit var pbRight: ProgressBar
 
     private lateinit var pbBass: ProgressBar
     private lateinit var pbMid: ProgressBar
@@ -83,6 +414,8 @@ class MainActivity : AppCompatActivity() {
 
     private val uiUpdater = object : Runnable {
         override fun run() {
+            vuMeterView.updateMeters()
+
             tvStatus.text = "STATUS: ${StreamState.statusText}"
             tvVerdict.text = "QUALITY VERDICT:\n${StreamState.qualityVerdict}"
 
@@ -99,9 +432,6 @@ class MainActivity : AppCompatActivity() {
             tvHex.text = "24-BIT PRE-DAC HEX: [ ${StreamState.hexPreview} ]"
             tvDb.text = "RMS Level: ${String.format("%.1f", StreamState.dbFs)} dBFS | Dynamic Crest: ${String.format("%.1f", StreamState.crestFactorDb)} dB"
 
-            pbLeft.progress = StreamState.leftLevel
-            pbRight.progress = StreamState.rightLevel
-
             pbBass.progress = StreamState.bandBass
             pbMid.progress = StreamState.bandMid
             pbTreble.progress = StreamState.bandTreble
@@ -116,7 +446,7 @@ class MainActivity : AppCompatActivity() {
                 btnStartStop.text = "START AUTO-MAX HI-RES CAPTURE"
                 btnStartStop.setBackgroundColor(Color.parseColor("#00C853"))
             }
-            uiHandler.postDelayed(this, 75)
+            uiHandler.postDelayed(this, 33) // 30 FPS for silky-smooth analog needle motion!
         }
     }
 
@@ -135,34 +465,37 @@ class MainActivity : AppCompatActivity() {
         val scroll = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#101418")) }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(36, 44, 36, 44)
+            setPadding(32, 40, 32, 44)
         }
 
         val title = TextView(this).apply {
-            text = "ESP32-S3 + PCM5102A\n24-Bit / Ultrasonic Hi-Res Analyzer"
-            textSize = 19f
+            text = "ESP32 + PCM5102A\n24-Bit Hi-Res Pre-DAC Streamer"
+            textSize = 18.5f
             setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#00E676"))
+            setTextColor(Color.parseColor("#FFB300"))
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 24)
+            setPadding(0, 0, 0, 20)
         }
         root.addView(title)
 
-        tvStatus = makeCardTextView("STATUS: Ready", "#FFFFFF", 14f, true)
+        // Illuminated Dual Analog VU Meter Console
+        val density = resources.displayMetrics.density
+        vuMeterView = DualAnalogVuMeterView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (235 * density).toInt()
+            ).apply { bottomMargin = 18 }
+        }
+        root.addView(vuMeterView)
+
+        tvDb = makeCardTextView("RMS Level: -100.0 dBFS", "#FFD54F", 12.5f, true)
+        root.addView(tvDb)
+
+        tvStatus = makeCardTextView("STATUS: Ready", "#FFFFFF", 13.5f, true)
         root.addView(tvStatus)
 
-        tvVerdict = makeCardTextView("QUALITY VERDICT:\nWaiting for audio...", "#FFD54F", 15f, true)
+        tvVerdict = makeCardTextView("QUALITY VERDICT:\nWaiting for audio...", "#00E676", 14f, true)
         root.addView(tvVerdict)
-
-        // L/R VU Meter
-        root.addView(makeLabel("PRE-DAC STEREO VU METER (L / R)"))
-        pbLeft = makeBar("#00E676")
-        pbRight = makeBar("#29B6F6")
-        root.addView(pbLeft)
-        root.addView(pbRight)
-
-        tvDb = makeCardTextView("RMS Level: -100.0 dBFS", "#B0BEC5", 12.5f, false)
-        root.addView(tvDb)
 
         // True 24-Bit Histogram Box
         tvBitHistogram = TextView(this).apply {
@@ -365,7 +698,7 @@ class MainActivity : AppCompatActivity() {
 }
 
 // ================================================================================
-// BACKGROUND ENGINE: Auto-Max 96kHz/48kHz Probe + 24-Bit Histogram + FFT Analyzer
+// BACKGROUND ENGINE: Auto-Max 48kHz Lock + 24-Bit Histogram + FFT Analyzer
 // ================================================================================
 class AudioCaptureService : Service() {
 
@@ -380,7 +713,6 @@ class AudioCaptureService : Service() {
                 StreamState.detectedSourceRate = "No Active Player"
                 return
             }
-            // Inspect active player configuration (via reflection if hidden by OS, else count)
             val sb = StringBuilder()
             for (cfg in configs) {
                 try {
@@ -433,8 +765,8 @@ class AudioCaptureService : Service() {
         )
 
         val notif = Notification.Builder(this, channelId)
-            .setContentTitle("Auto-Max 24-Bit Hi-Res Capture Active")
-            .setContentText("Analyzing 24-bit histogram & ultrasonic spectrum")
+            .setContentTitle("24-Bit Hi-Res Pre-DAC Capture Active")
+            .setContentText("Analog VU + 24-bit histogram & ESP32 streamer")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(openPending)
             .addAction(android.R.drawable.ic_media_pause, "STOP", stopPending)
@@ -448,7 +780,6 @@ class AudioCaptureService : Service() {
         }
     }
 
-    // Automatically probes highest supported lossless rate (96,000 Hz -> 48,000 Hz -> 44,100 Hz)
     private fun startAutoMaxHiResCapture(resultCode: Int, dataIntent: Intent) {
         val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = pm.getMediaProjection(resultCode, dataIntent)
@@ -499,7 +830,7 @@ class AudioCaptureService : Service() {
         StreamState.sampleRate = lockedRate
         audioRecord?.startRecording()
         StreamState.isRunning = true
-        StreamState.statusText = "LOCKED AT MAX HI-RES: ${lockedRate} Hz / 24-Bit Float-to-PCM"
+        StreamState.statusText = "LOCKED AT HI-RES: ${lockedRate} Hz / 24-Bit Float-to-PCM"
 
         captureThread = thread(start = true, name = "HiResPreDacThread") {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
@@ -517,10 +848,11 @@ class AudioCaptureService : Service() {
 
                 var sumL = 0.0
                 var sumR = 0.0
-                var peakAmp = 0.0
+                var peakL = 0.0
+                var peakR = 0.0
                 bitCounts.fill(0)
 
-                val pcm24Bytes = ByteArray(readCount * 3) // 24-bit (3 bytes per sample) for PCM5102A
+                val pcm24Bytes = ByteArray(readCount * 3)
                 var byteIdx = 0
                 val frames = readCount / 2
 
@@ -532,23 +864,20 @@ class AudioCaptureService : Service() {
 
                     val absL = abs(fL).toDouble()
                     val absR = abs(fR).toDouble()
-                    if (absL > peakAmp) peakAmp = absL
-                    if (absR > peakAmp) peakAmp = absR
+                    if (absL > peakL) peakL = absL
+                    if (absR > peakR) peakR = absR
 
                     sumL += (fL * fL)
                     sumR += (fR * fR)
 
-                    // Convert 32-bit Float to Signed 24-Bit Integer
                     val int24L = (fL * 8388607.0f).roundToInt()
                     val int24R = (fR * 8388607.0f).roundToInt()
 
-                    // Analyze every single bit from Bit 1 (MSB, bit index 23) down to Bit 24 (LSB, bit index 0)
                     val magL = abs(int24L)
                     val magR = abs(int24R)
                     val combinedBits = magL or magR
                     if (combinedBits != 0) {
                         for (b in 0 until 24) {
-                            // b=0 is MSB (Bit 1), b=23 is LSB (Bit 24)
                             val shift = 22 - b
                             val mask = if (shift >= 0) (1 shl shift) else 1
                             if ((combinedBits and mask) != 0) {
@@ -557,7 +886,6 @@ class AudioCaptureService : Service() {
                         }
                     }
 
-                    // Store Mono mix with Hann window for 1024-point FFT Spectrum Analyzer
                     if (frameIdx < 1024) {
                         val window = 0.5 * (1.0 - cos(2.0 * Math.PI * frameIdx / 1023.0))
                         fftReal[frameIdx] = ((fL + fR) * 0.5) * window
@@ -565,7 +893,6 @@ class AudioCaptureService : Service() {
                         frameIdx++
                     }
 
-                    // Pack Little-Endian 24-bit PCM for ESP32 -> PCM5102A
                     pcm24Bytes[byteIdx++] = (int24L and 0xFF).toByte()
                     pcm24Bytes[byteIdx++] = ((int24L shr 8) and 0xFF).toByte()
                     pcm24Bytes[byteIdx++] = ((int24L shr 16) and 0xFF).toByte()
@@ -577,7 +904,7 @@ class AudioCaptureService : Service() {
                     i += 2
                 }
 
-                // 1. Build True 24-Bit Histogram Display (Bits 01..24)
+                // 1. Build True 24-Bit Histogram Display
                 var activeBitsTotal = 0
                 val sb1 = StringBuilder("Bits 01-08 (MSB):   [")
                 val sb2 = StringBuilder("Bits 09-16 (16Bit): [")
@@ -599,13 +926,22 @@ class AudioCaptureService : Service() {
                 StreamState.activeBitCount = activeBitsTotal
                 StreamState.bitHistogramText = "$sb1\n$sb2\n$sb3"
 
-                // 2. Compute Levels & Dynamic Crest Factor
+                // 2. Compute Analog VU Dials, Peak LEDs & Dynamic Crest Factor
                 val safeFrames = frames.coerceAtLeast(1)
                 val rmsL = sqrt(sumL / safeFrames)
                 val rmsR = sqrt(sumR / safeFrames)
                 val maxRms = maxOf(rmsL, rmsR)
+                val peakAmp = maxOf(peakL, peakR)
+
+                val dbRmsL = if (rmsL > 0.00001) (20.0 * log10(rmsL)).toFloat() else -50f
+                val dbRmsR = if (rmsR > 0.00001) (20.0 * log10(rmsR)).toFloat() else -50f
                 val dbRms = if (maxRms > 0.0000001) 20.0 * log10(maxRms) else -100.0
                 val dbPeak = if (peakAmp > 0.0000001) 20.0 * log10(peakAmp) else -100.0
+
+                StreamState.leftDb = dbRmsL
+                StreamState.rightDb = dbRmsR
+                StreamState.leftPeak = peakL > 0.65 || dbRmsL > -9f
+                StreamState.rightPeak = peakR > 0.65 || dbRmsR > -9f
 
                 StreamState.dbFs = dbRms
                 StreamState.crestFactorDb = (dbPeak - dbRms).coerceAtLeast(0.0)
@@ -613,7 +949,7 @@ class AudioCaptureService : Service() {
                 StreamState.rightLevel = ((rmsR * 145).toInt()).coerceIn(0, 100)
                 StreamState.dataRateKbps = (lockedRate * 2 * 3) / 1000.0
 
-                // 3. Run 1024-Point FFT for High-Frequency Ultrasonic Spectrum (0 kHz - 48 kHz)
+                // 3. Run 1024-Point FFT for High-Frequency Ultrasonic Spectrum
                 if (frameIdx == 1024) {
                     computeFft1024(fftReal, fftImag)
                     val binHz = lockedRate / 1024.0
@@ -645,7 +981,6 @@ class AudioCaptureService : Service() {
                     StreamState.bandLossless = magToProgress(eLossless, 115.0)
                     StreamState.bandUltrasonic = magToProgress(eUltrasonic, 120.0)
 
-                    // 4. Automatic Quality Verdict
                     val has24BitDetail = bitCounts[18] > 5 || bitCounts[20] > 5 || bitCounts[22] > 5
                     StreamState.qualityVerdict = when {
                         maxRms < 0.0001 -> "SILENCE (Play a track in Apple Music)"
@@ -660,7 +995,6 @@ class AudioCaptureService : Service() {
                     }
                 }
 
-                // Hex Preview
                 val sbHex = StringBuilder()
                 for (b in 0 until minOf(9, pcm24Bytes.size)) {
                     sbHex.append(String.format("%02X ", pcm24Bytes[b]))
@@ -704,7 +1038,6 @@ class AudioCaptureService : Service() {
         return db.toInt().coerceIn(0, 100)
     }
 
-    // In-place Radix-2 Cooley-Tukey 1024-point FFT
     private fun computeFft1024(real: DoubleArray, imag: DoubleArray) {
         val n = 1024
         var j = 0
@@ -772,6 +1105,10 @@ class AudioCaptureService : Service() {
         mediaProjection = null
 
         audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+        StreamState.leftDb = -50f
+        StreamState.rightDb = -50f
+        StreamState.leftPeak = false
+        StreamState.rightPeak = false
         StreamState.statusText = "STOPPED - Ready"
         stopForeground(true)
         stopSelf()
