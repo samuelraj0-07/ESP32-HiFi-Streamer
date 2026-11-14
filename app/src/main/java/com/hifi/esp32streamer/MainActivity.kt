@@ -529,10 +529,16 @@ class MainActivity : AppCompatActivity() {
         tvDb = makeCardTextView("RMS Level: -100.0 dBFS", "#FFD54F", 12.5f, true)
         root.addView(tvDb)
 
-        tvStatus = makeCardTextView("STATUS: Ready", "#FFFFFF", 13.5f, true)
+        tvStatus = makeCardTextView("STATUS: Ready", "#FFFFFF", 13.5f, true).apply {
+            setLines(2)
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
         root.addView(tvStatus)
 
-        tvVerdict = makeCardTextView("QUALITY VERDICT:\nWaiting for audio...", "#00E676", 14f, true)
+        tvVerdict = makeCardTextView("QUALITY VERDICT:\nWaiting for audio...", "#00E676", 14f, true).apply {
+            setLines(4)
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
         root.addView(tvVerdict)
 
         // True 24-Bit Histogram Box
@@ -793,6 +799,13 @@ class AudioCaptureService : Service() {
             cleanupAndStop()
             return START_NOT_STICKY
         }
+        if (intent?.action == "ACTION_REPOST_NOTIF") {
+            if (StreamState.isRunning) {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(1001, buildCaptureNotification())
+            }
+            return START_STICKY
+        }
         if (intent?.action == "ACTION_START" && !StreamState.isRunning) {
             startForegroundNotification()
             val resultCode = intent.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED)
@@ -804,7 +817,7 @@ class AudioCaptureService : Service() {
         return START_STICKY
     }
 
-    private fun startForegroundNotification() {
+    private fun buildCaptureNotification(): Notification {
         val channelId = "HiFiStreamChannel"
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(channelId, "HiFi Audio Streamer", NotificationManager.IMPORTANCE_LOW)
@@ -818,16 +831,28 @@ class AudioCaptureService : Service() {
         val openPending = PendingIntent.getActivity(
             this, 2, openIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val repostIntent = Intent(this, AudioCaptureService::class.java).apply { action = "ACTION_REPOST_NOTIF" }
+        val repostPending = PendingIntent.getService(
+            this, 3, repostIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
 
         val notif = Notification.Builder(this, channelId)
             .setContentTitle("24-Bit Hi-Res Pre-DAC Capture Active")
             .setContentText("Analog VU + 24-bit histogram & ESP32 streamer")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(openPending)
+            .setDeleteIntent(repostPending)
             .addAction(android.R.drawable.ic_media_pause, "STOP", stopPending)
             .setOngoing(true)
+            .setAutoCancel(false)
             .build()
 
+        notif.flags = notif.flags or Notification.FLAG_ONGOING_EVENT or Notification.FLAG_NO_CLEAR
+        return notif
+    }
+
+    private fun startForegroundNotification() {
+        val notif = buildCaptureNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(1001, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {
