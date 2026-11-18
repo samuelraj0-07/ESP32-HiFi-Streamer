@@ -11,8 +11,8 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.*
 import android.os.*
-import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
@@ -24,16 +24,18 @@ import java.net.Socket
 import kotlin.concurrent.thread
 import kotlin.math.*
 
-// Shared Live State between Background Service and UI
+// ================================================================================
+// SHARED LIVE STATE BETWEEN BACKGROUND SERVICE AND INDUSTRIAL CONSOLE UI
+// ================================================================================
 object StreamState {
     @Volatile var isRunning = false
-    @Volatile var statusText = "IDLE - Auto-Max Hi-Res Engine Ready"
+    @Volatile var statusText = "IDLE"
     @Volatile var sampleRate = 48000
     @Volatile var nativeMixerRate = 48000
-    @Volatile var detectedSourceRate = "Auto-Detecting..."
+    @Volatile var detectedSourceRate = "48000Hz"
     @Volatile var activeBitCount = 0
-    @Volatile var bitHistogramText = "Bits 01-08: [--------]\nBits 09-16: [--------]\nBits 17-24: [--------]"
-    @Volatile var qualityVerdict = "Waiting for music playback..."
+    val bitActiveFlags = BooleanArray(24)
+    @Volatile var qualityVerdict = "WAITING FOR MUSIC PLAYBACK..."
     @Volatile var leftLevel = 0
     @Volatile var rightLevel = 0
     @Volatile var leftDb = -40f
@@ -43,17 +45,18 @@ object StreamState {
     @Volatile var dbFs = -100.0
     @Volatile var crestFactorDb = 0.0
     @Volatile var dataRateKbps = 0.0
-    @Volatile var hexPreview = "00 00 00 00 00 00 00 00"
+    @Volatile var hexPreview = "00 00 00 00 00 00"
 
     // 6-Band FFT Spectrum Analyzer Levels (0..100)
-    @Volatile var bandBass = 0       // 20 Hz - 250 Hz
-    @Volatile var bandMid = 0        // 250 Hz - 4 kHz
-    @Volatile var bandTreble = 0     // 4 kHz - 12 kHz
-    @Volatile var bandAir = 0        // 12 kHz - 16 kHz
-    @Volatile var bandLossless = 0   // 16 kHz - 20 kHz (MP3/AAC brickwall test)
-    @Volatile var bandUltrasonic = 0 // 20 kHz - 48 kHz (Hi-Res Ultrasonic test)
+    @Volatile var bandBass = 0
+    @Volatile var bandMid = 0
+    @Volatile var bandTreble = 0
+    @Volatile var bandAir = 0
+    @Volatile var bandLossless = 0
+    @Volatile var bandUltrasonic = 0
 
     @Volatile var streamToEsp32 = false
+    @Volatile var isEspConnected = false
     @Volatile var espIp = "192.168.4.1"
     @Volatile var espPort = 8888
     @Volatile var muteSpeaker = false
@@ -84,96 +87,177 @@ object StreamState {
 }
 
 // ================================================================================
-// CUSTOM ILLUMINATED VINTAGE ANALOG STEREO VU METER VIEW (LEFT & RIGHT DIALS)
+// HELPER: Draws Realistic 3D Brushed Metal Screws & LEDs on Canvas
+// ================================================================================
+object HardwareDraw {
+    private val pFill = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val pStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+
+    fun drawScrew(c: Canvas, cx: Float, cy: Float, r: Float) {
+        pFill.shader = RadialGradient(
+            cx - r * 0.25f, cy - r * 0.25f, r * 1.2f,
+            Color.parseColor("#9E9E9E"), Color.parseColor("#2B2B2B"), Shader.TileMode.CLAMP
+        )
+        c.drawCircle(cx, cy, r, pFill)
+        pFill.shader = null
+        pStroke.color = Color.parseColor("#141414")
+        pStroke.strokeWidth = 1.5f
+        c.drawCircle(cx, cy, r, pStroke)
+
+        // Phillips cross slot
+        pStroke.color = Color.parseColor("#1E1E1E")
+        pStroke.strokeWidth = (r * 0.28f).coerceAtLeast(2f)
+        c.drawLine(cx - r * 0.55f, cy - r * 0.15f, cx + r * 0.55f, cy + r * 0.15f, pStroke)
+        c.drawLine(cx - r * 0.15f, cy + r * 0.55f, cx + r * 0.15f, cy - r * 0.55f, pStroke)
+    }
+
+    fun drawLedLamp(c: Canvas, cx: Float, cy: Float, r: Float, isOn: Boolean, onColor: Int, offColor: Int) {
+        // Dark metallic socket ring
+        pFill.shader = null
+        pFill.color = Color.parseColor("#161616")
+        c.drawCircle(cx, cy, r * 1.28f, pFill)
+
+        if (isOn) {
+            // Outer halo glow
+            pFill.shader = RadialGradient(
+                cx, cy, r * 2.2f,
+                intArrayOf(Color.WHITE, onColor, Color.TRANSPARENT),
+                floatArrayOf(0f, 0.45f, 1f),
+                Shader.TileMode.CLAMP
+            )
+            c.drawCircle(cx, cy, r * 2.2f, pFill)
+        } else {
+            pFill.shader = RadialGradient(
+                cx - r * 0.2f, cy - r * 0.2f, r,
+                offColor, Color.parseColor("#121212"), Shader.TileMode.CLAMP
+            )
+            c.drawCircle(cx, cy, r, pFill)
+        }
+        pFill.shader = null
+    }
+}
+
+// ================================================================================
+// 1. TOP INDUSTRIAL NAMEPLATE ("TRANSMITTER #2 / ESP32 + PCM5102A")
+// ================================================================================
+class TransmitterHeaderView(context: Context) : View(context) {
+    private val plaquePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#555555")
+    }
+    private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#181818")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+    }
+    private val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#D0D0D0")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+
+        // Left & Right Chassis Screws
+        val screwR = h * 0.16f
+        HardwareDraw.drawScrew(canvas, screwR * 1.5f, h * 0.36f, screwR)
+        HardwareDraw.drawScrew(canvas, w - screwR * 1.5f, h * 0.36f, screwR)
+
+        // White/Silver Enamel Nameplate
+        val pLeft = screwR * 3.1f
+        val pRight = w - screwR * 3.1f
+        val pBottom = h * 0.62f
+        val rect = RectF(pLeft, h * 0.08f, pRight, pBottom)
+
+        plaquePaint.shader = LinearGradient(
+            0f, rect.top, 0f, rect.bottom,
+            intArrayOf(Color.parseColor("#F5F5F5"), Color.parseColor("#D6D6D6"), Color.parseColor("#BDBDBD")),
+            floatArrayOf(0f, 0.7f, 1f), Shader.TileMode.CLAMP
+        )
+        canvas.drawRoundRect(rect, 6f, 6f, plaquePaint)
+        canvas.drawRoundRect(rect, 6f, 6f, borderPaint)
+
+        titlePaint.textSize = (rect.height() * 0.58f).coerceIn(24f, 46f)
+        canvas.drawText(
+            "TRANSMITTER #2 / ESP32 + PCM5102A",
+            w / 2f,
+            rect.centerY() + titlePaint.textSize * 0.36f,
+            titlePaint
+        )
+
+        subPaint.textSize = (h * 0.22f).coerceIn(18f, 32f)
+        canvas.drawText("24-BIT HI-RES PRE-DAC STREAMER", w / 2f, h * 0.91f, subPaint)
+    }
+}
+
+// ================================================================================
+// 2. WHITE-FACE RECESSED STUDIO VU METERS (LEFT & RIGHT)
 // ================================================================================
 class DualAnalogVuMeterView(context: Context) : View(context) {
+    private var smoothAngleL = -36f
+    private var smoothAngleR = -36f
 
-    private var smoothAngleL = -48f
-    private var smoothAngleR = -48f
-
-    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#141414") }
-    private val bezelOuterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#2C2C2C")
-        style = Paint.Style.FILL
-    }
-    private val bezelInnerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#0D0D0D")
+    private val panelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val panelBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 5f
+        strokeWidth = 3f
+        color = Color.parseColor("#757575")
     }
-    private val dialFacePaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val scaleBlackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#2B1B0E")
+    private val bezelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#222222") }
+    private val innerShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 3.5f
+        strokeWidth = 6f
+        color = Color.parseColor("#111111")
     }
-    private val scaleRedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#D50000")
+    private val dialPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val arcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 4.5f
+        color = Color.parseColor("#212121")
+        strokeWidth = 3f
     }
-    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#2B1B0E")
+    private val numPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#212121")
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.SERIF, Typeface.BOLD)
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
     }
-    private val redTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#D50000")
-        textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.SERIF, Typeface.BOLD)
-    }
-    private val vuTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#23150A")
+    private val vuPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1B1B1B")
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
     }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#BDBDBD")
+        color = Color.parseColor("#E0E0E0")
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
-    }
-    private val peakTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#E53935")
-        textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
     }
     private val needleShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(85, 0, 0, 0)
+        color = Color.argb(70, 0, 0, 0)
         style = Paint.Style.STROKE
-        strokeWidth = 4.5f
+        strokeWidth = 5f
         strokeCap = Paint.Cap.ROUND
     }
     private val needlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#1A1A1A")
+        color = Color.parseColor("#262626")
         style = Paint.Style.STROKE
-        strokeWidth = 3.5f
+        strokeWidth = 3.8f
         strokeCap = Paint.Cap.ROUND
     }
-    private val pivotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#424242")
-        style = Paint.Style.FILL
-    }
-    private val ledPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-    // Maps dBFS (-40..0 dB) to VU needle angle (-48 deg to +48 deg, where 0 VU = +20 deg)
     private fun dbToAngle(db: Float): Float {
-        // Shift dBFS so typical -14 dBFS RMS sits around 0 VU, peaking up to +6 VU
-        val vu = (db + 10f).coerceIn(-25f, 6f)
-        val norm = when {
-            vu <= -20f -> (vu + 25f) / 5f * 0.08f
-            vu <= -10f -> 0.08f + (vu + 20f) / 10f * 0.18f
-            vu <= -3f  -> 0.26f + (vu + 10f) / 7f * 0.26f
-            vu <= 0f   -> 0.52f + (vu + 3f) / 3f * 0.19f
-            else       -> 0.71f + (vu / 6f) * 0.29f
-        }.coerceIn(0f, 1f)
-        return -48f + norm * 96f
+        val vu = (db + 10f).coerceIn(-22f, 3f)
+        val norm = ((vu + 22f) / 25f).coerceIn(0f, 1f)
+        return -36f + norm * 72f // Fits 100% cleanly inside the bezel!
     }
 
     fun updateMeters() {
-        val targetL = if (StreamState.isRunning) dbToAngle(StreamState.leftDb) else -48f
-        val targetR = if (StreamState.isRunning) dbToAngle(StreamState.rightDb) else -48f
+        val targetL = if (StreamState.isRunning) dbToAngle(StreamState.leftDb) else -36f
+        val targetR = if (StreamState.isRunning) dbToAngle(StreamState.rightDb) else -36f
 
-        // Analog VU ballistics: Fast attack (0.45), smooth natural decay (0.18)
         smoothAngleL += if (targetL > smoothAngleL) (targetL - smoothAngleL) * 0.45f else (targetL - smoothAngleL) * 0.18f
         smoothAngleR += if (targetR > smoothAngleR) (targetR - smoothAngleR) * 0.45f else (targetR - smoothAngleR) * 0.18f
         invalidate()
@@ -184,230 +268,783 @@ class DualAnalogVuMeterView(context: Context) : View(context) {
         val w = width.toFloat()
         val h = height.toFloat()
 
-        // Outer Dark Console Chassis
-        canvas.drawRoundRect(0f, 0f, w, h, 22f, 22f, bgPaint)
+        val chassisRect = RectF(4f, 4f, w - 4f, h - 4f)
+        panelPaint.shader = LinearGradient(
+            0f, 0f, 0f, h,
+            Color.parseColor("#35373A"), Color.parseColor("#242628"), Shader.TileMode.CLAMP
+        )
+        canvas.drawRoundRect(chassisRect, 18f, 18f, panelPaint)
+        canvas.drawRoundRect(chassisRect, 18f, 18f, panelBorderPaint)
 
-        val pad = w * 0.025f
+        val pad = w * 0.035f
         val meterW = (w - pad * 3f) / 2f
-        val topHeader = h * 0.18f
+        val topHeader = h * 0.21f
         val bottomFooter = h * 0.16f
         val meterH = h - topHeader - bottomFooter
 
-        // Draw LEFT and RIGHT Illuminated VU Meters
-        drawSingleVuMeter(
-            canvas,
-            left = pad,
-            top = topHeader,
-            mw = meterW,
-            mh = meterH,
-            needleAngleDeg = smoothAngleL,
-            isPeak = StreamState.leftPeak,
-            channelLabel = "LEFT"
-        )
-
-        drawSingleVuMeter(
-            canvas,
-            left = pad * 2f + meterW,
-            top = topHeader,
-            mw = meterW,
-            mh = meterH,
-            needleAngleDeg = smoothAngleR,
-            isPeak = StreamState.rightPeak,
-            channelLabel = "RIGHT"
-        )
-
-        // Center calibration screw decoration between LEFT and RIGHT
-        val cx = w / 2f
-        val cy = h - bottomFooter * 0.5f
-        pivotPaint.color = Color.parseColor("#373737")
-        canvas.drawCircle(cx, cy, 14f, pivotPaint)
-        scaleBlackPaint.color = Color.parseColor("#9E9E9E")
-        scaleBlackPaint.strokeWidth = 2f
-        canvas.drawLine(cx - 8f, cy - 6f, cx + 8f, cy + 6f, scaleBlackPaint)
-        scaleBlackPaint.color = Color.parseColor("#2B1B0E")
+        drawSingleMeter(canvas, pad, topHeader, meterW, meterH, smoothAngleL, StreamState.leftPeak, "LEFT")
+        drawSingleMeter(canvas, pad * 2f + meterW, topHeader, meterW, meterH, smoothAngleR, StreamState.rightPeak, "RIGHT")
     }
 
-    private fun drawSingleVuMeter(
-        canvas: Canvas,
-        left: Float,
-        top: Float,
-        mw: Float,
-        mh: Float,
-        needleAngleDeg: Float,
-        isPeak: Boolean,
-        channelLabel: String
+    private fun drawSingleMeter(
+        canvas: Canvas, left: Float, top: Float, mw: Float, mh: Float,
+        angleDeg: Float, isPeak: Boolean, label: String
     ) {
         val cx = left + mw / 2f
 
-        // 1. Draw Red "Peak" LED Lamp + Label at Top
-        val ledY = top * 0.35f
-        val ledRadius = (mw * 0.032f).coerceIn(7f, 14f)
-        if (isPeak) {
-            ledPaint.shader = RadialGradient(
-                cx, ledY, ledRadius * 2.2f,
-                intArrayOf(Color.parseColor("#FF8A80"), Color.parseColor("#FF1744"), Color.TRANSPARENT),
-                floatArrayOf(0f, 0.55f, 1f),
-                Shader.TileMode.CLAMP
-            )
-            canvas.drawCircle(cx, ledY, ledRadius * 2.2f, ledPaint)
-        } else {
-            ledPaint.shader = RadialGradient(
-                cx - 2f, ledY - 2f, ledRadius,
-                Color.parseColor("#8E3A3A"), Color.parseColor("#3E1212"),
-                Shader.TileMode.CLAMP
-            )
-            canvas.drawCircle(cx, ledY, ledRadius, ledPaint)
-        }
-        peakTextPaint.textSize = (mw * 0.068f).coerceIn(16f, 28f)
-        canvas.drawText("Peak", cx, top * 0.82f, peakTextPaint)
+        // Red PEAK Lamp & Label
+        HardwareDraw.drawLedLamp(
+            canvas, cx, top * 0.36f, (mw * 0.028f).coerceIn(7f, 12f),
+            isPeak, Color.parseColor("#FF1744"), Color.parseColor("#5D1919")
+        )
+        labelPaint.textSize = (mw * 0.058f).coerceIn(14f, 24f)
+        canvas.drawText("PEAK", cx, top * 0.84f, labelPaint)
 
-        // 2. Draw Outer Metallic Bezel
+        // Outer Dark Bezel
         val bezelRect = RectF(left, top, left + mw, top + mh)
-        canvas.drawRoundRect(bezelRect, 10f, 10f, bezelOuterPaint)
+        canvas.drawRoundRect(bezelRect, 12f, 12f, bezelPaint)
+        panelBorderPaint.strokeWidth = 2f
+        canvas.drawRoundRect(bezelRect, 12f, 12f, panelBorderPaint)
 
-        val faceInset = mw * 0.045f
-        val faceRect = RectF(
-            left + faceInset,
-            top + faceInset,
-            left + mw - faceInset,
-            top + mh - faceInset
+        // White/Silver Recessed Dial Window
+        val inset = mw * 0.055f
+        val faceRect = RectF(left + inset, top + inset, left + mw - inset, top + mh - inset)
+        dialPaint.shader = RadialGradient(
+            cx, faceRect.centerY(), faceRect.width() * 0.7f,
+            intArrayOf(Color.parseColor("#F5F7F8"), Color.parseColor("#D8DCDF"), Color.parseColor("#ABB0B5")),
+            floatArrayOf(0f, 0.65f, 1f), Shader.TileMode.CLAMP
         )
+        canvas.drawRoundRect(faceRect, 6f, 6f, dialPaint)
+        canvas.drawRoundRect(faceRect, 6f, 6f, innerShadowPaint)
 
-        // 3. Warm Amber / Yellow Illuminated Backlight Gradient
-        dialFacePaint.shader = RadialGradient(
-            cx,
-            faceRect.bottom - faceRect.height() * 0.15f,
-            faceRect.width() * 0.72f,
-            intArrayOf(
-                Color.parseColor("#FFF3B0"), // Bright warm bulb center
-                Color.parseColor("#FFB300"), // Classic amber mid
-                Color.parseColor("#E67E00")  // Deep vintage orange edge
-            ),
-            floatArrayOf(0f, 0.58f, 1f),
-            Shader.TileMode.CLAMP
-        )
-        canvas.drawRect(faceRect, dialFacePaint)
-        canvas.drawRect(faceRect, bezelInnerPaint)
-
-        // 4. Pivot Point (Below the bottom edge of the window) & Scale Arcs
         val pivotX = cx
-        val pivotY = faceRect.bottom + faceRect.height() * 0.22f
-        val arcRadius = faceRect.height() * 0.86f
+        val pivotY = faceRect.bottom + faceRect.height() * 0.28f
+        val arcR = faceRect.height() * 0.84f
 
         canvas.save()
         canvas.clipRect(faceRect)
 
-        val arcRect = RectF(
-            pivotX - arcRadius,
-            pivotY - arcRadius,
-            pivotX + arcRadius,
-            pivotY + arcRadius
-        )
+        // Scale Arc (-36 deg to +36 deg around -90 deg UP = -126 deg to -54 deg)
+        val arcRect = RectF(pivotX - arcR, pivotY - arcR, pivotX + arcR, pivotY + arcR)
+        arcPaint.strokeWidth = 2.8f
+        canvas.drawArc(arcRect, -126f, 72f, false, arcPaint)
 
-        scaleBlackPaint.strokeWidth = 3.2f
-        scaleRedPaint.strokeWidth = 5.0f
-        canvas.drawArc(arcRect, -138f, 68f, false, scaleBlackPaint) // -20 to 0 VU
-        canvas.drawArc(arcRect, -70f, 28f, false, scaleRedPaint)    // 0 to +6 VU Red Zone
-
-        // Inner secondary sub-arc for % modulation
-        val innerRadius = arcRadius * 0.92f
-        val innerArcRect = RectF(
-            pivotX - innerRadius,
-            pivotY - innerRadius,
-            pivotX + innerRadius,
-            pivotY + innerRadius
-        )
-        scaleBlackPaint.strokeWidth = 1.8f
-        canvas.drawArc(innerArcRect, -138f, 68f, false, scaleBlackPaint)
-
-        // 5. Tick Marks & Numbers (-20, -10, -7, -5, -3, -1, 0, +3, +6)
-        data class Tick(val norm: Float, val label: String, val isRed: Boolean, val subPct: String? = null)
+        // Major & Minor Ticks (10, 7, 5, 3, 1, 0, 1) - 100% inside window!
+        data class VuTick(val norm: Float, val txt: String, val major: Boolean)
         val ticks = listOf(
-            Tick(0.04f, "-", false, "%"),
-            Tick(0.10f, "20", false, "20"),
-            Tick(0.26f, "10", false, "40"),
-            Tick(0.37f, "7", false, "60"),
-            Tick(0.45f, "5", false),
-            Tick(0.53f, "3", false, "80"),
-            Tick(0.64f, "1", false),
-            Tick(0.71f, "0", true, "100"),
-            Tick(0.85f, "3", true),
-            Tick(0.97f, "6", true, "+")
+            VuTick(0.00f, "10", true),
+            VuTick(0.10f, "", false),
+            VuTick(0.20f, "7", true),
+            VuTick(0.30f, "", false),
+            VuTick(0.40f, "5", true),
+            VuTick(0.50f, "", false),
+            VuTick(0.60f, "3", true),
+            VuTick(0.70f, "", false),
+            VuTick(0.80f, "1", true),
+            VuTick(0.90f, "0", true),
+            VuTick(1.00f, "1", true)
         )
 
-        textPaint.textSize = (mw * 0.052f).coerceIn(11f, 22f)
-        redTextPaint.textSize = textPaint.textSize
-        val subTextSize = textPaint.textSize * 0.82f
-
+        numPaint.textSize = (mw * 0.062f).coerceIn(13f, 24f)
         for (t in ticks) {
-            val degFromUp = -48f + t.norm * 96f
-            val rad = Math.toRadians((degFromUp - 90f).toDouble())
+            val deg = -36f + t.norm * 72f
+            val rad = Math.toRadians((deg - 90f).toDouble())
             val cosA = cos(rad).toFloat()
             val sinA = sin(rad).toFloat()
 
-            val rOuter = arcRadius * 1.09f
-            val rInner = arcRadius * 0.99f
-            val rText = arcRadius * 1.19f
+            val rIn = arcR
+            val rOut = if (t.major) arcR * 1.11f else arcR * 1.06f
+            arcPaint.strokeWidth = if (t.major) 3f else 2f
+            canvas.drawLine(pivotX + rIn * cosA, pivotY + rIn * sinA, pivotX + rOut * cosA, pivotY + rOut * sinA, arcPaint)
 
-            val pTick = if (t.isRed) scaleRedPaint else scaleBlackPaint
-            pTick.strokeWidth = if (t.label == "0") 4f else 2.5f
-            canvas.drawLine(
-                pivotX + rInner * cosA, pivotY + rInner * sinA,
-                pivotX + rOuter * cosA, pivotY + rOuter * sinA,
-                pTick
-            )
-
-            val pTxt = if (t.isRed) redTextPaint else textPaint
-            pTxt.textSize = (mw * 0.052f).coerceIn(11f, 22f)
-            canvas.drawText(
-                t.label,
-                pivotX + rText * cosA,
-                pivotY + rText * sinA + pTxt.textSize * 0.35f,
-                pTxt
-            )
-
-            if (t.subPct != null) {
-                val rSub = arcRadius * 0.81f
-                textPaint.textSize = subTextSize
-                canvas.drawText(
-                    t.subPct,
-                    pivotX + rSub * cosA,
-                    pivotY + rSub * sinA + subTextSize * 0.35f,
-                    textPaint
-                )
+            if (t.txt.isNotEmpty()) {
+                val rTxt = arcR * 1.24f
+                canvas.drawText(t.txt, pivotX + rTxt * cosA, pivotY + rTxt * sinA + numPaint.textSize * 0.35f, numPaint)
             }
         }
 
-        // 6. "VU" & "DECIBEL POWER LEVEL" Faceplate Text
-        vuTitlePaint.textSize = (mw * 0.088f).coerceIn(18f, 34f)
-        canvas.drawText("VU", cx, faceRect.top + faceRect.height() * 0.72f, vuTitlePaint)
+        // "VU" Legend
+        vuPaint.textSize = (mw * 0.095f).coerceIn(20f, 36f)
+        canvas.drawText("VU", cx, faceRect.bottom - faceRect.height() * 0.16f, vuPaint)
 
-        vuTitlePaint.textSize = (mw * 0.038f).coerceIn(9f, 15f)
-        canvas.drawText("DECIBEL POWER LEVEL", cx, faceRect.top + faceRect.height() * 0.84f, vuTitlePaint)
-
-        // 7. Draw Swinging Needle + Drop Shadow
-        val needleRad = Math.toRadians((needleAngleDeg - 90f).toDouble())
-        val nLen = arcRadius * 1.14f
-        val tipX = pivotX + nLen * cos(needleRad).toFloat()
-        val tipY = pivotY + nLen * sin(needleRad).toFloat()
+        // Swinging Needle + Drop Shadow
+        val nRad = Math.toRadians((angleDeg - 90f).toDouble())
+        val nLen = arcR * 1.15f
+        val tipX = pivotX + nLen * cos(nRad).toFloat()
+        val tipY = pivotY + nLen * sin(nRad).toFloat()
 
         canvas.drawLine(pivotX + 4f, pivotY + 4f, tipX + 4f, tipY + 4f, needleShadowPaint)
         canvas.drawLine(pivotX, pivotY, tipX, tipY, needlePaint)
-
-        // Bottom Pivot Cap
-        pivotPaint.color = Color.parseColor("#2B2B2B")
-        canvas.drawCircle(pivotX, faceRect.bottom + faceRect.height() * 0.04f, mw * 0.07f, pivotPaint)
-
         canvas.restore()
 
-        // 8. "LEFT" / "RIGHT" Console Legend Below Meter
-        labelPaint.textSize = (mw * 0.075f).coerceIn(18f, 30f)
-        canvas.drawText(channelLabel, cx, top + mh + (height - (top + mh)) * 0.68f, labelPaint)
+        // LEFT / RIGHT Footer
+        labelPaint.textSize = (mw * 0.07f).coerceIn(16f, 28f)
+        canvas.drawText(label, cx, top + mh + (height - (top + mh)) * 0.68f, labelPaint)
     }
 }
 
 // ================================================================================
-// MAIN ACTIVITY
+// 3. SIDE-BY-SIDE STATUS & RMS LEVELS CONSOLE (Vintage Paper Tags + 4x3 LED Grid)
+// ================================================================================
+class StatusAndRmsPanelView(context: Context) : View(context) {
+    private val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#8D8D8D")
+    }
+    private val paperPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#E0E0E0")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.NORMAL)
+    }
+    private val paperTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1B1B1B")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+    }
+    private val footerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#CCCCCC")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.NORMAL)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val gap = w * 0.02f
+        val cardW = (w - gap) / 2f
+
+        val shortStatus = when {
+            !StreamState.isRunning -> "STATUS: IDLE"
+            StreamState.isEspConnected -> "WIFI: ACTIVE"
+            StreamState.streamToEsp32 -> "WIFI: WAIT"
+            else -> "LOCAL: ${StreamState.sampleRate / 1000}kHz"
+        }
+        val subStatus = if (StreamState.isRunning) {
+            "${StreamState.sampleRate}Hz | ${String.format("%.0f", StreamState.dataRateKbps)} KB/s"
+        } else {
+            "STATUS: IDLE (${StreamState.nativeMixerRate}Hz)"
+        }
+
+        drawModuleCard(
+            canvas, 4f, 4f, cardW - 4f, h - 8f,
+            title = "STATUS",
+            paperTxt = shortStatus,
+            footerTxt = subStatus,
+            amberActive = StreamState.isRunning,
+            greenActive = StreamState.isEspConnected || (StreamState.isRunning && !StreamState.streamToEsp32)
+        )
+
+        val rmsStr = if (StreamState.dbFs <= -99.0) "RMS: -100.0 dBFS" else "RMS: ${String.format("%.1f", StreamState.dbFs)} dBFS"
+        val crestStr = "RMS: ${String.format("%.1f", StreamState.dbFs)} / CREST: ${String.format("%.1f", StreamState.crestFactorDb)} dB"
+
+        drawModuleCard(
+            canvas, cardW + gap, 4f, cardW - 4f, h - 8f,
+            title = "RMS Levels",
+            paperTxt = rmsStr,
+            footerTxt = crestStr,
+            amberActive = StreamState.dbFs > -45.0,
+            greenActive = StreamState.dbFs > -25.0
+        )
+    }
+
+    private fun drawModuleCard(
+        canvas: Canvas, x: Float, y: Float, cw: Float, ch: Float,
+        title: String, paperTxt: String, footerTxt: String,
+        amberActive: Boolean, greenActive: Boolean
+    ) {
+        val rect = RectF(x, y, x + cw, y + ch)
+        boxPaint.shader = LinearGradient(
+            x, y, x, y + ch,
+            Color.parseColor("#383A3D"), Color.parseColor("#26282A"), Shader.TileMode.CLAMP
+        )
+        canvas.drawRoundRect(rect, 18f, 18f, boxPaint)
+        canvas.drawRoundRect(rect, 18f, 18f, borderPaint)
+
+        val pad = cw * 0.06f
+        titlePaint.textSize = (ch * 0.16f).coerceIn(18f, 30f)
+        canvas.drawText(title, x + pad, y + ch * 0.23f, titlePaint)
+
+        // Vintage Aged-Paper Tag
+        val pTop = y + ch * 0.31f
+        val pBottom = y + ch * 0.72f
+        val pRight = x + cw * 0.63f
+        val paperRect = RectF(x + pad, pTop, pRight, pBottom)
+        paperPaint.shader = LinearGradient(
+            paperRect.left, pTop, paperRect.right, pBottom,
+            Color.parseColor("#E8DEC8"), Color.parseColor("#C9B99B"), Shader.TileMode.CLAMP
+        )
+        canvas.drawRoundRect(paperRect, 4f, 4f, paperPaint)
+
+        paperTextPaint.textSize = (ch * 0.145f).coerceIn(15f, 26f)
+        canvas.drawText(paperTxt, paperRect.left + 12f, paperRect.centerY() + paperTextPaint.textSize * 0.35f, paperTextPaint)
+
+        // 4x3 Indicator LED Matrix on Right of Paper Tag
+        val gridLeft = pRight + cw * 0.05f
+        val gridW = (x + cw - pad) - gridLeft
+        val gridH = pBottom - pTop
+        val cols = 4
+        val rows = 3
+        val ledR = (minOf(gridW / cols, gridH / rows) * 0.32f).coerceIn(4f, 9f)
+
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                val lx = gridLeft + (c + 0.5f) * (gridW / cols)
+                val ly = pTop + (r + 0.5f) * (gridH / rows)
+                val isAmberSpot = (c == 0 && r < 2)
+                val isGreenSpot = (r == 2 && c >= 2)
+                val isOn = (isAmberSpot && amberActive) || (isGreenSpot && greenActive)
+                val onCol = if (isAmberSpot) Color.parseColor("#FFB300") else Color.parseColor("#00E676")
+                val offCol = if (isAmberSpot) Color.parseColor("#4E3810") else Color.parseColor("#193D24")
+                HardwareDraw.drawLedLamp(canvas, lx, ly, ledR, isOn, onCol, offCol)
+            }
+        }
+
+        footerPaint.textSize = (ch * 0.115f).coerceIn(13f, 21f)
+        canvas.drawText(footerTxt, x + pad, y + ch * 0.90f, footerPaint)
+    }
+}
+
+// ================================================================================
+// 4. BRUSHED STEEL "QUALITY VERDICT" PLATE WITH SCREWS & LAMPS
+// ================================================================================
+class QualityVerdictPlateView(context: Context) : View(context) {
+    private val outerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#8D8D8D")
+    }
+    private val platePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val slotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#CFC7B8") }
+    private val slotBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#5D5951")
+    }
+    private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#E0E0E0")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.NORMAL)
+    }
+    private val darkLabel = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#181818")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+
+        val outer = RectF(4f, 4f, w - 4f, h - 4f)
+        outerPaint.shader = LinearGradient(0f, 0f, 0f, h, Color.parseColor("#383A3D"), Color.parseColor("#26282A"), Shader.TileMode.CLAMP)
+        canvas.drawRoundRect(outer, 18f, 18f, outerPaint)
+        canvas.drawRoundRect(outer, 18f, 18f, borderPaint)
+
+        val pad = w * 0.035f
+        titlePaint.textSize = (h * 0.16f).coerceIn(18f, 28f)
+        canvas.drawText("QUALITY VERDICT", pad, h * 0.22f, titlePaint)
+
+        // Brushed Metal Inner Plate
+        val plate = RectF(pad, h * 0.28f, w - pad, h * 0.90f)
+        platePaint.shader = LinearGradient(
+            plate.left, plate.top, plate.left, plate.bottom,
+            intArrayOf(Color.parseColor("#B8B9B4"), Color.parseColor("#92948F"), Color.parseColor("#767874")),
+            floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP
+        )
+        canvas.drawRoundRect(plate, 10f, 10f, platePaint)
+
+        val sr = plate.height() * 0.08f
+        HardwareDraw.drawScrew(canvas, plate.left + sr * 2f, plate.top + sr * 2f, sr)
+        HardwareDraw.drawScrew(canvas, plate.right - sr * 2f, plate.top + sr * 2f, sr)
+        HardwareDraw.drawScrew(canvas, plate.left + sr * 2f, plate.bottom - sr * 2f, sr)
+        HardwareDraw.drawScrew(canvas, plate.right - sr * 2f, plate.bottom - sr * 2f, sr)
+
+        darkLabel.textSize = (plate.height() * 0.23f).coerceIn(16f, 26f)
+        canvas.drawText("VERDICT", plate.left + plate.width() * 0.13f, plate.top + plate.height() * 0.30f, darkLabel)
+
+        // OFF / ON & OFF / READY Lamps
+        val rLed = (plate.height() * 0.095f).coerceIn(6f, 12f)
+        val row1Y = plate.top + plate.height() * 0.52f
+        val row2Y = plate.top + plate.height() * 0.78f
+        darkLabel.textSize = (plate.height() * 0.19f).coerceIn(13f, 22f)
+
+        canvas.drawText("OFF", plate.left + plate.width() * 0.08f, row1Y + darkLabel.textSize * 0.35f, darkLabel)
+        HardwareDraw.drawLedLamp(canvas, plate.left + plate.width() * 0.17f, row1Y, rLed, !StreamState.isRunning, Color.parseColor("#FF5252"), Color.parseColor("#4A1C1C"))
+        HardwareDraw.drawLedLamp(canvas, plate.left + plate.width() * 0.22f, row1Y, rLed, StreamState.isRunning, Color.parseColor("#FFB300"), Color.parseColor("#4E3810"))
+        canvas.drawText("ON", plate.left + plate.width() * 0.26f, row1Y + darkLabel.textSize * 0.35f, darkLabel)
+
+        val isReadyLossless = StreamState.isRunning && StreamState.activeBitCount >= 16
+        canvas.drawText("OFF", plate.left + plate.width() * 0.08f, row2Y + darkLabel.textSize * 0.35f, darkLabel)
+        HardwareDraw.drawLedLamp(canvas, plate.left + plate.width() * 0.17f, row2Y, rLed, !isReadyLossless, Color.parseColor("#8D6E63"), Color.parseColor("#3E2723"))
+        HardwareDraw.drawLedLamp(canvas, plate.left + plate.width() * 0.22f, row2Y, rLed, isReadyLossless, Color.parseColor("#00E676"), Color.parseColor("#193D24"))
+        canvas.drawText("READY", plate.left + plate.width() * 0.26f, row2Y + darkLabel.textSize * 0.35f, darkLabel)
+
+        // Recessed Paper/Stencil Slot on Right
+        val slotRect = RectF(plate.left + plate.width() * 0.39f, plate.top + plate.height() * 0.32f, plate.right - plate.width() * 0.05f, plate.bottom - plate.height() * 0.22f)
+        canvas.drawRoundRect(slotRect, 6f, 6f, slotPaint)
+        canvas.drawRoundRect(slotRect, 6f, 6f, slotBorder)
+
+        darkLabel.textSize = (slotRect.height() * 0.44f).coerceIn(13f, 22f)
+        val verdictShort = StreamState.qualityVerdict.take(32)
+        canvas.drawText(verdictShort, slotRect.left + 12f, slotRect.centerY() + darkLabel.textSize * 0.35f, darkLabel)
+    }
+}
+
+// ================================================================================
+// 5. TRUE 24-BIT HISTOGRAM (3x8 Glowing Amber Nixie/Vacuum Segment Blocks)
+// ================================================================================
+class Histogram24BitMatrixView(context: Context) : View(context) {
+    private val outerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#8D8D8D")
+    }
+    private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#E0E0E0")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.NORMAL)
+    }
+    private val rowLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#D6D6D6")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.NORMAL)
+    }
+    private val blockPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val blockFramePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f
+        color = Color.parseColor("#141414")
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+
+        val outer = RectF(4f, 4f, w - 4f, h - 4f)
+        outerPaint.shader = LinearGradient(0f, 0f, 0f, h, Color.parseColor("#35373A"), Color.parseColor("#222426"), Shader.TileMode.CLAMP)
+        canvas.drawRoundRect(outer, 18f, 18f, outerPaint)
+        canvas.drawRoundRect(outer, 18f, 18f, borderPaint)
+
+        val pad = w * 0.035f
+        titlePaint.textSize = (h * 0.15f).coerceIn(18f, 28f)
+        canvas.drawText(
+            "TRUE 24-BIT HISTOGRAM (${StreamState.activeBitCount}/24 BITS)   HEX: ${StreamState.hexPreview}",
+            pad, h * 0.21f, titlePaint
+        )
+
+        val labels = arrayOf("Bits 01-08:", "Bits 09-16:", "Bits 17-24:")
+        val startY = h * 0.28f
+        val availH = h * 0.65f
+        val rowH = availH / 3f
+        val gridLeft = w * 0.26f
+        val gridW = (w - pad) - gridLeft
+        val cellW = gridW / 8f
+
+        rowLabelPaint.textSize = (rowH * 0.56f).coerceIn(15f, 26f)
+
+        for (r in 0 until 3) {
+            val ry = startY + r * rowH
+            canvas.drawText(labels[r], pad, ry + rowH * 0.68f, rowLabelPaint)
+
+            for (c in 0 until 8) {
+                val bitIdx = r * 8 + c
+                val isLit = StreamState.isRunning && StreamState.bitActiveFlags[bitIdx]
+
+                val bx = gridLeft + c * cellW + 4f
+                val by = ry + 5f
+                val rect = RectF(bx, by, bx + cellW - 8f, ry + rowH - 5f)
+
+                if (isLit) {
+                    blockPaint.shader = RadialGradient(
+                        rect.centerX(), rect.centerY(), rect.width() * 0.7f,
+                        intArrayOf(Color.parseColor("#FFF59D"), Color.parseColor("#FFB300"), Color.parseColor("#E65100")),
+                        floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP
+                    )
+                } else {
+                    blockPaint.shader = LinearGradient(
+                        rect.left, rect.top, rect.left, rect.bottom,
+                        Color.parseColor("#3E2F1B"), Color.parseColor("#241B0F"), Shader.TileMode.CLAMP
+                    )
+                }
+                canvas.drawRoundRect(rect, 5f, 5f, blockPaint)
+                canvas.drawRoundRect(rect, 5f, 5f, blockFramePaint)
+            }
+        }
+    }
+}
+
+// ================================================================================
+// 6. HIGH-FREQUENCY ULTRASONIC SPECTRUM (Segmented LED Bar-Graph Console)
+// ================================================================================
+class UltrasonicLedSpectrumView(context: Context) : View(context) {
+    private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#EAEAEA")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+    }
+    private val subHeaderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#CCCCCC")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.NORMAL)
+    }
+    private val bandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#DCDCDC")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.NORMAL)
+    }
+    private val btnPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#2E3033") }
+    private val btnStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        color = Color.parseColor("#111111")
+    }
+    private val segPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val pad = w * 0.025f
+
+        titlePaint.textSize = (h * 0.068f).coerceIn(16f, 28f)
+        canvas.drawText("HIGH-FREQUENCY ULTRASONIC SPECTRUM (0 kHz - 48 kHz)", pad, h * 0.08f, titlePaint)
+
+        subHeaderPaint.textSize = (h * 0.055f).coerceIn(13f, 22f)
+        canvas.drawText("${StreamState.sampleRate}Hz / 24-Bit Pipe", pad, h * 0.15f, subHeaderPaint)
+        canvas.drawText("Sub/Bass", w * 0.49f, h * 0.15f, subHeaderPaint)
+        canvas.drawText("Calibration", w * 0.83f, h * 0.15f, subHeaderPaint)
+
+        val bands = arrayOf(
+            "Sub/Bass (20Hz - 250Hz)" to StreamState.bandBass,
+            "Midrange (250Hz - 4kHz)" to StreamState.bandMid,
+            "Treble (4kHz - 12kHz)" to StreamState.bandTreble,
+            "Air Band (12kHz - 16kHz)" to StreamState.bandAir,
+            "Lossless Proof (16kHz - 20kHz)" to StreamState.bandLossless,
+            "Hi-Res Ultrasonic (20kHz - 48kHz)" to StreamState.bandUltrasonic
+        )
+
+        val topY = h * 0.18f
+        val availH = h * 0.79f
+        val rowH = availH / 6f
+
+        // Vertical Master Green Ladder Column
+        val vColX = w * 0.575f
+        val vColW = w * 0.032f
+        val vSegs = 24
+        val vSegH = availH / vSegs
+        val masterLvl = ((StreamState.leftLevel + StreamState.rightLevel) / 2).coerceIn(0, 100)
+        val litMasterSegs = (masterLvl * vSegs) / 100
+
+        for (s in 0 until vSegs) {
+            val invS = (vSegs - 1) - s
+            val sy = topY + s * vSegH + 2f
+            val isLit = StreamState.isRunning && (invS < litMasterSegs)
+            segPaint.color = when {
+                !isLit -> Color.parseColor("#1B281E")
+                invS > 19 -> Color.parseColor("#FFB300")
+                else -> Color.parseColor("#00E676")
+            }
+            canvas.drawRoundRect(vColX, sy, vColX + vColW, sy + vSegH - 3f, 2f, 2f, segPaint)
+        }
+
+        // 6 Horizontal Frequency Rows
+        val barLeft = w * 0.63f
+        val barRight = w * 0.855f
+        val barW = barRight - barLeft
+        val hSegs = 10
+        val segW = barW / hSegs
+
+        bandPaint.textSize = (rowH * 0.42f).coerceIn(13f, 22f)
+
+        for (i in bands.indices) {
+            val (label, level) = bands[i]
+            val ry = topY + i * rowH
+            val cy = ry + rowH * 0.5f
+
+            // Band Title on Left
+            canvas.drawText(label, pad, cy + bandPaint.textSize * 0.35f, bandPaint)
+
+            // Left Red Activity Lamp + Tactile Button
+            HardwareDraw.drawLedLamp(
+                canvas, w * 0.525f, cy, (rowH * 0.14f).coerceIn(4f, 8f),
+                StreamState.isRunning && level > 65,
+                Color.parseColor("#FF1744"), Color.parseColor("#3E1616")
+            )
+            val lBtn = RectF(w * 0.495f, cy - rowH * 0.25f, w * 0.55f, cy + rowH * 0.25f)
+            if (i % 2 == 1) {
+                canvas.drawRoundRect(lBtn, 5f, 5f, btnPaint)
+                canvas.drawRoundRect(lBtn, 5f, 5f, btnStroke)
+            }
+
+            // 10-Segment Horizontal LED Bar (Green -> Yellow -> Orange -> Red)
+            val activeSegs = if (StreamState.isRunning) (level * hSegs) / 100 else 0
+            for (s in 0 until hSegs) {
+                val sx = barLeft + s * segW + 2f
+                val sRect = RectF(sx, cy - rowH * 0.22f, sx + segW - 4f, cy + rowH * 0.22f)
+                val isLit = s < activeSegs
+                segPaint.color = when {
+                    !isLit -> when {
+                        s < 4 -> Color.parseColor("#193320")
+                        s < 7 -> Color.parseColor("#3D3014")
+                        else -> Color.parseColor("#3D1616")
+                    }
+                    s < 4 -> Color.parseColor("#00E676")
+                    s < 7 -> Color.parseColor("#FFB300")
+                    s < 9 -> Color.parseColor("#FF6D00")
+                    else -> Color.parseColor("#FF1744")
+                }
+                canvas.drawRoundRect(sRect, 3f, 3f, segPaint)
+            }
+
+            // Right Calibration Amber Lamp + Tactile Button
+            HardwareDraw.drawLedLamp(
+                canvas, w * 0.885f, cy, (rowH * 0.15f).coerceIn(5f, 9f),
+                StreamState.isRunning && level > 15,
+                Color.parseColor("#FFB300"), Color.parseColor("#3E2D12")
+            )
+            val rBtn = RectF(w * 0.91f, cy - rowH * 0.26f, w * 0.965f, cy + rowH * 0.26f)
+            canvas.drawRoundRect(rBtn, 5f, 5f, btnPaint)
+            canvas.drawRoundRect(rBtn, 5f, 5f, btnStroke)
+        }
+    }
+}
+
+// ================================================================================
+// 7. 3D INDUSTRIAL MECHANICAL ROCKER SWITCH ROW
+// ================================================================================
+class IndustrialRockerSwitchRow(
+    context: Context,
+    private val label: String,
+    var isChecked: Boolean,
+    private val onToggle: (Boolean) -> Unit
+) : View(context) {
+
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#E4E4E4")
+        typeface = Typeface.create("sans-serif-condensed", Typeface.NORMAL)
+    }
+    private val housingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#141517") }
+    private val housingBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#45484C")
+    }
+    private val rockerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.action == MotionEvent.ACTION_UP) {
+            isChecked = !isChecked
+            onToggle(isChecked)
+            invalidate()
+        }
+        return true
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val pad = w * 0.03f
+
+        textPaint.textSize = (h * 0.28f).coerceIn(15f, 26f)
+        val lines = label.split("\n")
+        if (lines.size == 1) {
+            canvas.drawText(lines[0], pad, h * 0.58f, textPaint)
+        } else {
+            canvas.drawText(lines[0], pad, h * 0.42f, textPaint)
+            canvas.drawText(lines[1], pad, h * 0.76f, textPaint)
+        }
+
+        // 3D Mechanical Rocker Switch on Right
+        val swW = w * 0.17f
+        val swH = h * 0.76f
+        val swLeft = w - pad - swW
+        val swTop = (h - swH) / 2f
+        val housing = RectF(swLeft, swTop, swLeft + swW, swTop + swH)
+        canvas.drawRoundRect(housing, 8f, 8f, housingPaint)
+        canvas.drawRoundRect(housing, 8f, 8f, housingBorder)
+
+        val inset = 6f
+        val rocker = RectF(housing.left + inset, housing.top + inset, housing.right - inset, housing.bottom - inset)
+        rockerPaint.shader = if (isChecked) {
+            LinearGradient(
+                rocker.left, rocker.top, rocker.right, rocker.top,
+                intArrayOf(Color.parseColor("#1C1D1F"), Color.parseColor("#3E4246"), Color.parseColor("#5A6065")),
+                floatArrayOf(0f, 0.7f, 1f), Shader.TileMode.CLAMP
+            )
+        } else {
+            LinearGradient(
+                rocker.left, rocker.top, rocker.right, rocker.top,
+                intArrayOf(Color.parseColor("#505559"), Color.parseColor("#2E3134"), Color.parseColor("#18191B")),
+                floatArrayOf(0f, 0.3f, 1f), Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawRoundRect(rocker, 5f, 5f, rockerPaint)
+
+        // Status LED dot next to switch
+        HardwareDraw.drawLedLamp(
+            canvas, swLeft - 24f, h / 2f, 8f,
+            isChecked, Color.parseColor("#00E676"), Color.parseColor("#263238")
+        )
+    }
+}
+
+// ================================================================================
+// 8. "FILAMENT HOURS" MECHANICAL ODOMETER DRUM IP COUNTER (Tap to Edit IP)
+// ================================================================================
+class FilamentIpCounterView(context: Context, private val onTapEdit: () -> Unit) : View(context) {
+    private val platePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val plateBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#8D8D8D")
+    }
+    private val recessPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#111214") }
+    private val drumPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val headerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1B1B1B")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+    }
+    private val digitPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#F5F5F5")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.action == MotionEvent.ACTION_UP) {
+            onTapEdit()
+        }
+        return true
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val pad = w * 0.03f
+
+        val plate = RectF(pad, 6f, w - pad, h - 6f)
+        platePaint.shader = LinearGradient(
+            0f, plate.top, 0f, plate.bottom,
+            intArrayOf(Color.parseColor("#A6A8A4"), Color.parseColor("#7D807C"), Color.parseColor("#5E615E")),
+            floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP
+        )
+        canvas.drawRoundRect(plate, 14f, 14f, platePaint)
+        canvas.drawRoundRect(plate, 14f, 14f, plateBorder)
+
+        val sr = h * 0.09f
+        HardwareDraw.drawScrew(canvas, plate.left + sr * 1.8f, h * 0.55f, sr)
+        HardwareDraw.drawScrew(canvas, plate.right - sr * 1.8f, h * 0.55f, sr)
+
+        headerPaint.textSize = (h * 0.17f).coerceIn(15f, 25f)
+        canvas.drawText("FILAMENT HOURS / ESP32 IP (TAP TO EDIT)", w / 2f, plate.top + h * 0.23f, headerPaint)
+
+        // Recessed Odometer Drum Window
+        val winLeft = plate.left + sr * 3.6f
+        val winRight = plate.right - sr * 3.6f
+        val winTop = plate.top + h * 0.32f
+        val winBottom = plate.bottom - h * 0.12f
+        val winRect = RectF(winLeft, winTop, winRight, winBottom)
+        canvas.drawRoundRect(winRect, 8f, 8f, recessPaint)
+
+        val chars = StreamState.espIp.toCharArray()
+        val count = chars.size.coerceAtLeast(1)
+        val cellW = winRect.width() / count
+
+        digitPaint.textSize = (winRect.height() * 0.68f).coerceIn(22f, 44f)
+
+        for (i in chars.indices) {
+            val dLeft = winLeft + i * cellW + 3f
+            val dRect = RectF(dLeft, winTop + 4f, dLeft + cellW - 6f, winBottom - 4f)
+            drumPaint.shader = LinearGradient(
+                0f, dRect.top, 0f, dRect.bottom,
+                intArrayOf(Color.parseColor("#161719"), Color.parseColor("#373A3E"), Color.parseColor("#141517")),
+                floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP
+            )
+            canvas.drawRoundRect(dRect, 4f, 4f, drumPaint)
+            canvas.drawText(
+                chars[i].toString(),
+                dRect.centerX(),
+                dRect.centerY() + digitPaint.textSize * 0.35f,
+                digitPaint
+            )
+        }
+    }
+}
+
+// ================================================================================
+// 9. HEAVY-DUTY BACKLIT GLASS-GLOW START / STOP PUSHBUTTON
+// ================================================================================
+class IlluminatedStartButtonView(context: Context, private val onClick: () -> Unit) : View(context) {
+    private val framePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#787878")
+    }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#FFF8E1")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.action == MotionEvent.ACTION_UP) {
+            onClick()
+            invalidate()
+        }
+        return true
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val pad = w * 0.05f
+
+        val outer = RectF(pad, 6f, w - pad, h - 6f)
+        framePaint.shader = LinearGradient(0f, outer.top, 0f, outer.bottom, Color.parseColor("#6E7175"), Color.parseColor("#2B2D2F"), Shader.TileMode.CLAMP)
+        canvas.drawRoundRect(outer, 16f, 16f, framePaint)
+        canvas.drawRoundRect(outer, 16f, 16f, borderPaint)
+
+        val inner = RectF(outer.left + 12f, outer.top + 10f, outer.right - 12f, outer.bottom - 10f)
+        glassPaint.shader = LinearGradient(0f, inner.top, 0f, inner.bottom, Color.parseColor("#1E2420"), Color.parseColor("#121513"), Shader.TileMode.CLAMP)
+        canvas.drawRoundRect(inner, 10f, 10f, glassPaint)
+
+        if (StreamState.isRunning) {
+            glowPaint.shader = RadialGradient(
+                inner.centerX(), inner.centerY(), inner.width() * 0.55f,
+                intArrayOf(Color.parseColor("#99FF1744"), Color.parseColor("#55D50000"), Color.TRANSPARENT),
+                floatArrayOf(0f, 0.6f, 1f), Shader.TileMode.CLAMP
+            )
+            canvas.drawRoundRect(inner, 10f, 10f, glowPaint)
+        } else {
+            // Dual Green (left) + Amber (right) underglow matching mockup!
+            glowPaint.shader = RadialGradient(
+                inner.left + inner.width() * 0.28f, inner.centerY(), inner.width() * 0.35f,
+                intArrayOf(Color.parseColor("#8800E676"), Color.TRANSPARENT),
+                floatArrayOf(0f, 1f), Shader.TileMode.CLAMP
+            )
+            canvas.drawRoundRect(inner, 10f, 10f, glowPaint)
+
+            glowPaint.shader = RadialGradient(
+                inner.left + inner.width() * 0.68f, inner.centerY(), inner.width() * 0.38f,
+                intArrayOf(Color.parseColor("#77FFB300"), Color.TRANSPARENT),
+                floatArrayOf(0f, 1f), Shader.TileMode.CLAMP
+            )
+            canvas.drawRoundRect(inner, 10f, 10f, glowPaint)
+        }
+
+        textPaint.textSize = (inner.height() * 0.42f).coerceIn(18f, 32f)
+        val label = if (StreamState.isRunning) "STOP CAPTURE & STREAM" else "START AUTO-MAX HI-RES CAPTURE"
+        canvas.drawText(label, w / 2f, inner.centerY() + textPaint.textSize * 0.35f, textPaint)
+    }
+}
+
+// ================================================================================
+// MAIN ACTIVITY: Assembles the "TRANSMITTER #2" Industrial Console
 // ================================================================================
 class MainActivity : AppCompatActivity() {
 
@@ -416,60 +1053,24 @@ class MainActivity : AppCompatActivity() {
     private val uiHandler = Handler(Looper.getMainLooper())
 
     private lateinit var vuMeterView: DualAnalogVuMeterView
-    private lateinit var tvStatus: TextView
-    private lateinit var tvVerdict: TextView
-    private lateinit var tvFormatInfo: TextView
-    private lateinit var tvBitHistogram: TextView
-    private lateinit var tvHex: TextView
-    private lateinit var tvDb: TextView
-
-    private lateinit var pbBass: ProgressBar
-    private lateinit var pbMid: ProgressBar
-    private lateinit var pbTreble: ProgressBar
-    private lateinit var pbAir: ProgressBar
-    private lateinit var pbLossless: ProgressBar
-    private lateinit var pbUltrasonic: ProgressBar
-
-    private lateinit var btnStartStop: Button
-    private lateinit var swEspMode: Switch
-    private lateinit var swMute: Switch
-    private lateinit var etIp: EditText
+    private lateinit var statusRmsView: StatusAndRmsPanelView
+    private lateinit var verdictView: QualityVerdictPlateView
+    private lateinit var histogramView: Histogram24BitMatrixView
+    private lateinit var spectrumView: UltrasonicLedSpectrumView
+    private lateinit var muteSwitchRow: IndustrialRockerSwitchRow
+    private lateinit var espSwitchRow: IndustrialRockerSwitchRow
+    private lateinit var ipCounterView: FilamentIpCounterView
+    private lateinit var startButtonView: IlluminatedStartButtonView
 
     private val uiUpdater = object : Runnable {
         override fun run() {
             vuMeterView.updateMeters()
-
-            tvStatus.text = "STATUS: ${StreamState.statusText}"
-            tvVerdict.text = "QUALITY VERDICT:\n${StreamState.qualityVerdict}"
-
-            val nyquistKhz = StreamState.sampleRate / 2000.0
-            tvFormatInfo.text =
-                "Auto-Max Pipe: ${StreamState.sampleRate} Hz | 24-Bit PCM (Max Freq: ${nyquistKhz} kHz)\n" +
-                "Phone Native Mixer: ${StreamState.nativeMixerRate} Hz | App Stream: ${StreamState.detectedSourceRate}\n" +
-                "Wi-Fi Bitrate: ${String.format("%.1f", StreamState.dataRateKbps)} KB/s (${String.format("%.2f", StreamState.dataRateKbps * 8 / 1000.0)} Mbps)"
-
-            tvBitHistogram.text =
-                "TRUE 24-BIT HISTOGRAM (Active: ${StreamState.activeBitCount}/24 Bits)\n" +
-                StreamState.bitHistogramText
-
-            tvHex.text = "24-BIT PRE-DAC HEX: [ ${StreamState.hexPreview} ]"
-            tvDb.text = "RMS Level: ${String.format("%.1f", StreamState.dbFs)} dBFS | Dynamic Crest: ${String.format("%.1f", StreamState.crestFactorDb)} dB"
-
-            pbBass.progress = StreamState.bandBass
-            pbMid.progress = StreamState.bandMid
-            pbTreble.progress = StreamState.bandTreble
-            pbAir.progress = StreamState.bandAir
-            pbLossless.progress = StreamState.bandLossless
-            pbUltrasonic.progress = StreamState.bandUltrasonic
-
-            if (StreamState.isRunning) {
-                btnStartStop.text = "STOP CAPTURE & STREAM"
-                btnStartStop.setBackgroundColor(Color.parseColor("#D32F2F"))
-            } else {
-                btnStartStop.text = "START AUTO-MAX HI-RES CAPTURE"
-                btnStartStop.setBackgroundColor(Color.parseColor("#00C853"))
-            }
-            uiHandler.postDelayed(this, 33) // 30 FPS for silky-smooth analog needle motion!
+            statusRmsView.invalidate()
+            verdictView.invalidate()
+            histogramView.invalidate()
+            spectrumView.invalidate()
+            startButtonView.invalidate()
+            uiHandler.postDelayed(this, 33) // 30 FPS smooth animation
         }
     }
 
@@ -479,11 +1080,10 @@ class MainActivity : AppCompatActivity() {
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         StreamState.nativeMixerRate = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull() ?: 48000
 
-        buildDashboardUi()
+        buildTransmitterRackUi()
         requestNeededPermissions()
     }
 
-    // LAYER 1 MUTE LOCK: Intercept physical Volume Up/Down keys when Mute Speaker switch is ON
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (StreamState.muteSpeaker && (
                 event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
@@ -492,202 +1092,124 @@ class MainActivity : AppCompatActivity() {
             )) {
             StreamState.enforceSpeakerMuteLock(audioManager)
             if (event.action == KeyEvent.ACTION_DOWN) {
-                Toast.makeText(this, "Phone Speaker Locked Muted (Uncheck Mute switch to change volume)", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Speaker Locked Muted", Toast.LENGTH_SHORT).show()
             }
-            return true // Swallow hardware volume key so Android cannot unmute speaker!
+            return true
         }
         return super.dispatchKeyEvent(event)
     }
 
-    private fun buildDashboardUi() {
-        val scroll = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#101418")) }
+    private fun buildTransmitterRackUi() {
+        val d = resources.displayMetrics.density
+        fun dp(v: Int) = (v * d).toInt()
+
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(Color.parseColor("#232528"))
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(32, 40, 32, 44)
+            setPadding(dp(10), dp(12), dp(10), dp(20))
         }
 
-        val title = TextView(this).apply {
-            text = "ESP32 + PCM5102A\n24-Bit Hi-Res Pre-DAC Streamer"
-            textSize = 18.5f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#FFB300"))
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 20)
+        // 1. Top Nameplate
+        root.addView(TransmitterHeaderView(this), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(72)).apply {
+            bottomMargin = dp(8)
+        })
+
+        // 2. White-Face Dual Studio VU Meters
+        vuMeterView = DualAnalogVuMeterView(this)
+        root.addView(vuMeterView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(215)).apply {
+            bottomMargin = dp(10)
+        })
+
+        // 3. Side-by-Side STATUS & RMS Levels Cards
+        statusRmsView = StatusAndRmsPanelView(this)
+        root.addView(statusRmsView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(118)).apply {
+            bottomMargin = dp(10)
+        })
+
+        // 4. Screw-Mounted Quality Verdict Plate
+        verdictView = QualityVerdictPlateView(this)
+        root.addView(verdictView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(115)).apply {
+            bottomMargin = dp(10)
+        })
+
+        // 5. True 24-Bit Histogram (3x8 Glowing Amber Blocks)
+        histogramView = Histogram24BitMatrixView(this)
+        root.addView(histogramView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(138)).apply {
+            bottomMargin = dp(12)
+        })
+
+        // 6. 6-Band Ultrasonic LED Spectrum Console
+        spectrumView = UltrasonicLedSpectrumView(this)
+        root.addView(spectrumView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(255)).apply {
+            bottomMargin = dp(10)
+        })
+
+        // 7. Industrial Rocker Switches
+        muteSwitchRow = IndustrialRockerSwitchRow(
+            this,
+            "Mute Phone Speaker (Locked Even if Volume Up\nPressed)",
+            StreamState.muteSpeaker
+        ) { checked ->
+            StreamState.muteSpeaker = checked
+            if (checked) StreamState.enforceSpeakerMuteLock(audioManager)
+            else StreamState.releaseSpeakerMuteLock(audioManager)
         }
-        root.addView(title)
+        root.addView(muteSwitchRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(56)).apply {
+            bottomMargin = dp(6)
+        })
 
-        // Illuminated Dual Analog VU Meter Console
-        val density = resources.displayMetrics.density
-        vuMeterView = DualAnalogVuMeterView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                (235 * density).toInt()
-            ).apply { bottomMargin = 18 }
+        espSwitchRow = IndustrialRockerSwitchRow(
+            this,
+            "Stream 24-Bit PCM to ESP32 Wi-Fi (Keep Off for\nLocal Test)",
+            StreamState.streamToEsp32
+        ) { checked ->
+            StreamState.streamToEsp32 = checked
         }
-        root.addView(vuMeterView)
+        root.addView(espSwitchRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(56)).apply {
+            bottomMargin = dp(10)
+        })
 
-        tvDb = makeCardTextView("RMS Level: -100.0 dBFS", "#FFD54F", 12.5f, true)
-        root.addView(tvDb)
-
-        tvStatus = makeCardTextView("STATUS: Ready", "#FFFFFF", 13.5f, true).apply {
-            setLines(2)
-            ellipsize = android.text.TextUtils.TruncateAt.END
+        // 8. "FILAMENT HOURS" Mechanical Odometer IP Counter
+        ipCounterView = FilamentIpCounterView(this) {
+            showEditIpDialog()
         }
-        root.addView(tvStatus)
+        root.addView(ipCounterView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(96)).apply {
+            bottomMargin = dp(12)
+        })
 
-        tvVerdict = makeCardTextView("QUALITY VERDICT:\nWaiting for audio...", "#00E676", 14f, true).apply {
-            setLines(4)
-            ellipsize = android.text.TextUtils.TruncateAt.END
-        }
-        root.addView(tvVerdict)
-
-        // True 24-Bit Histogram Box
-        tvBitHistogram = TextView(this).apply {
-            text = "TRUE 24-BIT HISTOGRAM"
-            setTextColor(Color.parseColor("#80D8FF"))
-            typeface = Typeface.MONOSPACE
-            textSize = 13f
-            setBackgroundColor(Color.parseColor("#1B2228"))
-            setPadding(24, 24, 24, 24)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = 16 }
-            layoutParams = lp
-        }
-        root.addView(tvBitHistogram)
-
-        // Ultrasonic FFT Spectrum Analyzer (0 kHz to 48 kHz)
-        root.addView(makeLabel("HIGH-FREQUENCY ULTRASONIC SPECTRUM (0 kHz - 48 kHz)"))
-        pbBass = addSpectrumRow(root, "Sub/Bass (20Hz - 250Hz)", "#4FC3F7")
-        pbMid = addSpectrumRow(root, "Midrange (250Hz - 4kHz)", "#4DB6AC")
-        pbTreble = addSpectrumRow(root, "Treble (4kHz - 12kHz)", "#81C784")
-        pbAir = addSpectrumRow(root, "Air Band (12kHz - 16kHz)", "#DCE775")
-        pbLossless = addSpectrumRow(root, "Lossless Proof (16kHz - 20kHz)", "#FFB74D")
-        pbUltrasonic = addSpectrumRow(root, "Hi-Res Ultrasonic (20kHz - 48kHz)", "#FF5252")
-
-        // Format & Stream Info
-        tvFormatInfo = makeCardTextView("Format Info...", "#A7FFEB", 12.5f, false)
-        root.addView(tvFormatInfo)
-
-        tvHex = TextView(this).apply {
-            text = "24-BIT PRE-DAC HEX: [ 00 00 00 ]"
-            setTextColor(Color.parseColor("#76FF03"))
-            typeface = Typeface.MONOSPACE
-            textSize = 12.5f
-            setBackgroundColor(Color.parseColor("#1B2228"))
-            setPadding(24, 20, 24, 20)
-        }
-        root.addView(tvHex)
-
-        // Switches
-        swMute = Switch(this).apply {
-            text = "Mute Phone Speaker (Locked Even If Volume Up Pressed)"
-            setTextColor(Color.WHITE)
-            textSize = 13f
-            isChecked = StreamState.muteSpeaker
-            setPadding(0, 24, 0, 12)
-            setOnCheckedChangeListener { _, isChecked ->
-                StreamState.muteSpeaker = isChecked
-                if (isChecked) {
-                    StreamState.enforceSpeakerMuteLock(audioManager)
-                } else {
-                    StreamState.releaseSpeakerMuteLock(audioManager)
-                }
+        // 9. Illuminated Start / Stop Pushbutton
+        startButtonView = IlluminatedStartButtonView(this) {
+            if (StreamState.isRunning) {
+                stopCaptureService()
+            } else {
+                startMediaProjectionRequest()
             }
         }
-        root.addView(swMute)
-
-        swEspMode = Switch(this).apply {
-            text = "Stream 24-Bit PCM to ESP32 Wi-Fi (Keep OFF for Local Test)"
-            setTextColor(Color.parseColor("#81D4FA"))
-            textSize = 13f
-            isChecked = StreamState.streamToEsp32
-            setPadding(0, 8, 0, 16)
-            setOnCheckedChangeListener { _, isChecked ->
-                StreamState.streamToEsp32 = isChecked
-            }
-        }
-        root.addView(swEspMode)
-
-        root.addView(makeLabel("ESP32 HOTSPOT IP ADDRESS (Port 8888)"))
-        etIp = EditText(this).apply {
-            setText("192.168.4.1")
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#263238"))
-            setPadding(24, 18, 24, 18)
-        }
-        root.addView(etIp)
-
-        btnStartStop = Button(this).apply {
-            text = "START AUTO-MAX HI-RES CAPTURE"
-            setTextColor(Color.WHITE)
-            textSize = 15f
-            setTypeface(null, Typeface.BOLD)
-            setPadding(0, 32, 0, 32)
-            setOnClickListener {
-                if (StreamState.isRunning) {
-                    stopCaptureService()
-                } else {
-                    StreamState.espIp = etIp.text.toString().trim()
-                    startMediaProjectionRequest()
-                }
-            }
-        }
-        val btnParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = 32 }
-        root.addView(btnStartStop, btnParams)
+        root.addView(startButtonView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(76)))
 
         scroll.addView(root)
         setContentView(scroll)
     }
 
-    private fun makeBar(hexColor: String): ProgressBar {
-        return ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            progressDrawable.setColorFilter(Color.parseColor(hexColor), android.graphics.PorterDuff.Mode.SRC_IN)
-            setPadding(0, 6, 0, 6)
+    private fun showEditIpDialog() {
+        val input = EditText(this).apply {
+            setText(StreamState.espIp)
+            setSelection(text.length)
         }
-    }
-
-    private fun addSpectrumRow(parent: LinearLayout, label: String, colorHex: String): ProgressBar {
-        val tv = TextView(this).apply {
-            text = label
-            setTextColor(Color.parseColor("#CFD8DC"))
-            textSize = 11.5f
-        }
-        val pb = makeBar(colorHex)
-        parent.addView(tv)
-        parent.addView(pb)
-        return pb
-    }
-
-    private fun makeCardTextView(txt: String, hexColor: String, size: Float, bold: Boolean): TextView {
-        return TextView(this).apply {
-            text = txt
-            setTextColor(Color.parseColor(hexColor))
-            textSize = size
-            if (bold) setTypeface(null, Typeface.BOLD)
-            setBackgroundColor(Color.parseColor("#1B2228"))
-            setPadding(24, 18, 24, 18)
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = 14 }
-            layoutParams = lp
-        }
-    }
-
-    private fun makeLabel(txt: String): TextView {
-        return TextView(this).apply {
-            text = txt
-            setTextColor(Color.parseColor("#90A4AE"))
-            textSize = 12f
-            setTypeface(null, Typeface.BOLD)
-            setPadding(0, 18, 0, 6)
-        }
+        AlertDialog.Builder(this)
+            .setTitle("ESP32 Hotspot IP Address (Port 8888)")
+            .setView(input)
+            .setPositiveButton("SAVE") { _, _ ->
+                val v = input.text.toString().trim()
+                if (v.isNotEmpty()) {
+                    StreamState.espIp = v
+                    ipCounterView.invalidate()
+                }
+            }
+            .setNegativeButton("CANCEL", null)
+            .show()
     }
 
     private fun requestNeededPermissions() {
@@ -743,7 +1265,7 @@ class MainActivity : AppCompatActivity() {
 }
 
 // ================================================================================
-// BACKGROUND ENGINE: Auto-Max 48kHz Lock + 24-Bit Histogram + FFT + Mute Lock
+// BACKGROUND ENGINE: Auto-Recovering Non-Blocking Pipe + Mute Lock + Wi-Fi TCP
 // ================================================================================
 class AudioCaptureService : Service() {
 
@@ -751,8 +1273,8 @@ class AudioCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var captureThread: Thread? = null
     private lateinit var audioManager: AudioManager
+    @Volatile private var hasActivePlaybackStream = false
 
-    // LAYER 2 MUTE LOCK: System-wide BroadcastReceiver catches Volume Up/Down even inside Apple Music!
     private val volumeLockReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (StreamState.muteSpeaker) {
@@ -763,8 +1285,9 @@ class AudioCaptureService : Service() {
 
     private val playbackCallback = object : AudioManager.AudioPlaybackCallback() {
         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
+            hasActivePlaybackStream = !configs.isNullOrEmpty()
             if (configs.isNullOrEmpty()) {
-                StreamState.detectedSourceRate = "No Active Player"
+                StreamState.detectedSourceRate = "Idle"
                 return
             }
             val sb = StringBuilder()
@@ -777,7 +1300,7 @@ class AudioCaptureService : Service() {
                     }
                 } catch (_: Exception) {}
             }
-            StreamState.detectedSourceRate = if (sb.isNotEmpty()) sb.toString().trim() else "${configs.size} Active Stream(s)"
+            StreamState.detectedSourceRate = if (sb.isNotEmpty()) sb.toString().trim() else "${configs.size} Stream(s)"
         }
     }
 
@@ -799,13 +1322,6 @@ class AudioCaptureService : Service() {
             cleanupAndStop()
             return START_NOT_STICKY
         }
-        if (intent?.action == "ACTION_REPOST_NOTIF") {
-            if (StreamState.isRunning) {
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(1001, buildCaptureNotification())
-            }
-            return START_STICKY
-        }
         if (intent?.action == "ACTION_START" && !StreamState.isRunning) {
             startForegroundNotification()
             val resultCode = intent.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED)
@@ -817,7 +1333,7 @@ class AudioCaptureService : Service() {
         return START_STICKY
     }
 
-    private fun buildCaptureNotification(): Notification {
+    private fun startForegroundNotification() {
         val channelId = "HiFiStreamChannel"
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(channelId, "HiFi Audio Streamer", NotificationManager.IMPORTANCE_LOW)
@@ -831,28 +1347,16 @@ class AudioCaptureService : Service() {
         val openPending = PendingIntent.getActivity(
             this, 2, openIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val repostIntent = Intent(this, AudioCaptureService::class.java).apply { action = "ACTION_REPOST_NOTIF" }
-        val repostPending = PendingIntent.getService(
-            this, 3, repostIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
 
         val notif = Notification.Builder(this, channelId)
-            .setContentTitle("24-Bit Hi-Res Pre-DAC Capture Active")
-            .setContentText("Analog VU + 24-bit histogram & ESP32 streamer")
+            .setContentTitle("Transmitter #2 Pre-DAC Streamer Active")
+            .setContentText("24-Bit PCM / ESP32 Wi-Fi Audio Engine")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(openPending)
-            .setDeleteIntent(repostPending)
             .addAction(android.R.drawable.ic_media_pause, "STOP", stopPending)
             .setOngoing(true)
-            .setAutoCancel(false)
             .build()
 
-        notif.flags = notif.flags or Notification.FLAG_ONGOING_EVENT or Notification.FLAG_NO_CLEAR
-        return notif
-    }
-
-    private fun startForegroundNotification() {
-        val notif = buildCaptureNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(1001, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {
@@ -860,50 +1364,57 @@ class AudioCaptureService : Service() {
         }
     }
 
-    private fun startAutoMaxHiResCapture(resultCode: Int, dataIntent: Intent) {
-        val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = pm.getMediaProjection(resultCode, dataIntent)
-
-        val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+    private fun buildAndStartAudioRecord(lockedRate: Int): AudioRecord? {
+        val proj = mediaProjection ?: return null
+        val config = AudioPlaybackCaptureConfiguration.Builder(proj)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(AudioAttributes.USAGE_GAME)
             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
             .build()
 
+        val minBuf = AudioRecord.getMinBufferSize(
+            lockedRate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_FLOAT
+        )
+        val format = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+            .setSampleRate(lockedRate)
+            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+            .build()
+
+        val rec = AudioRecord.Builder()
+            .setAudioFormat(format)
+            .setBufferSizeInBytes(maxOf(minBuf * 2, 8192 * 4))
+            .setAudioPlaybackCaptureConfig(config)
+            .build()
+
+        return if (rec.state == AudioRecord.STATE_INITIALIZED) {
+            rec.startRecording()
+            rec
+        } else {
+            rec.release()
+            null
+        }
+    }
+
+    private fun startAutoMaxHiResCapture(resultCode: Int, dataIntent: Intent) {
+        val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = pm.getMediaProjection(resultCode, dataIntent)
+
         val candidateRates = intArrayOf(48000, 44100)
         var lockedRate = 48000
-
         for (rate in candidateRates) {
             try {
-                val minBuf = AudioRecord.getMinBufferSize(
-                    rate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_FLOAT
-                )
-                if (minBuf <= 0) continue
-
-                val format = AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                    .setSampleRate(rate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                    .build()
-
-                val candidateRecord = AudioRecord.Builder()
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(maxOf(minBuf * 2, 8192 * 4))
-                    .setAudioPlaybackCaptureConfig(config)
-                    .build()
-
-                if (candidateRecord.state == AudioRecord.STATE_INITIALIZED) {
-                    audioRecord = candidateRecord
+                val rec = buildAndStartAudioRecord(rate)
+                if (rec != null) {
+                    audioRecord = rec
                     lockedRate = rate
                     break
-                } else {
-                    candidateRecord.release()
                 }
             } catch (_: Exception) {}
         }
 
         if (audioRecord == null) {
-            StreamState.statusText = "ERROR: Could not initialize Pre-DAC Pipe"
+            StreamState.statusText = "ERROR"
             return
         }
 
@@ -912,28 +1423,80 @@ class AudioCaptureService : Service() {
         }
 
         StreamState.sampleRate = lockedRate
-        audioRecord?.startRecording()
         StreamState.isRunning = true
-        StreamState.statusText = "LOCKED AT HI-RES: ${lockedRate} Hz / 24-Bit Float-to-PCM"
+        StreamState.statusText = "ACTIVE"
 
         captureThread = thread(start = true, name = "HiResPreDacThread") {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-            val floatSamples = FloatArray(2048) // 1024 Stereo Frames
+            val floatSamples = FloatArray(2048)
             val fftReal = DoubleArray(1024)
             val fftImag = DoubleArray(1024)
             val bitCounts = IntArray(24)
 
             var socket: Socket? = null
             var outStream: OutputStream? = null
+            var zeroReadStreakMs = 0L
+            var lastTickMs = SystemClock.elapsedRealtime()
+            var lastKeepAliveMs = SystemClock.elapsedRealtime()
 
             while (StreamState.isRunning) {
-                // LAYER 3 MUTE LOCK: Continuously enforce speaker mute in real-time audio loop
                 if (StreamState.muteSpeaker) {
                     StreamState.enforceSpeakerMuteLock(audioManager)
                 }
 
-                val readCount = audioRecord?.read(floatSamples, 0, floatSamples.size, AudioRecord.READ_BLOCKING) ?: 0
-                if (readCount <= 0) continue
+                val rawRead = audioRecord?.read(floatSamples, 0, floatSamples.size, AudioRecord.READ_NON_BLOCKING) ?: -1
+                val readCount = rawRead - (rawRead % 2)
+
+                val nowMs = SystemClock.elapsedRealtime()
+                val dt = nowMs - lastTickMs
+                lastTickMs = nowMs
+
+                if (readCount <= 0) {
+                    zeroReadStreakMs += dt
+
+                    if (zeroReadStreakMs > 250) {
+                        StreamState.leftDb = -50f
+                        StreamState.rightDb = -50f
+                        StreamState.leftPeak = false
+                        StreamState.rightPeak = false
+                        StreamState.dbFs = -100.0
+                        StreamState.activeBitCount = 0
+                        for (b in 0 until 24) StreamState.bitActiveFlags[b] = false
+                        StreamState.hexPreview = "00 00 00 00 00 00"
+                        StreamState.qualityVerdict = "PAUSED / WAITING FOR MUSIC..."
+                        StreamState.bandBass = 0; StreamState.bandMid = 0; StreamState.bandTreble = 0
+                        StreamState.bandAir = 0; StreamState.bandLossless = 0; StreamState.bandUltrasonic = 0
+                    }
+
+                    if (hasActivePlaybackStream && zeroReadStreakMs > 1000) {
+                        try {
+                            audioRecord?.stop()
+                            audioRecord?.release()
+                        } catch (_: Exception) {}
+                        audioRecord = buildAndStartAudioRecord(lockedRate)
+                        zeroReadStreakMs = 0
+                    }
+
+                    if (!StreamState.streamToEsp32 && socket != null) {
+                        try { socket.close() } catch (_: Exception) {}
+                        socket = null; outStream = null
+                        StreamState.isEspConnected = false
+                    } else if (StreamState.streamToEsp32 && outStream != null && (nowMs - lastKeepAliveMs > 250)) {
+                        try {
+                            outStream.write(ByteArray(60))
+                            lastKeepAliveMs = nowMs
+                        } catch (_: Exception) {
+                            try { socket?.close() } catch (_: Exception) {}
+                            socket = null; outStream = null
+                            StreamState.isEspConnected = false
+                        }
+                    }
+
+                    Thread.sleep(6)
+                    continue
+                }
+
+                zeroReadStreakMs = 0
 
                 var sumL = 0.0
                 var sumR = 0.0
@@ -949,7 +1512,7 @@ class AudioCaptureService : Service() {
                 var i = 0
                 while (i < readCount) {
                     val fL = floatSamples[i].coerceIn(-1.0f, 1.0f)
-                    val fR = if (i + 1 < readCount) floatSamples[i + 1].coerceIn(-1.0f, 1.0f) else 0f
+                    val fR = floatSamples[i + 1].coerceIn(-1.0f, 1.0f)
 
                     val absL = abs(fL).toDouble()
                     val absR = abs(fR).toDouble()
@@ -962,9 +1525,7 @@ class AudioCaptureService : Service() {
                     val int24L = (fL * 8388607.0f).roundToInt()
                     val int24R = (fR * 8388607.0f).roundToInt()
 
-                    val magL = abs(int24L)
-                    val magR = abs(int24R)
-                    val combinedBits = magL or magR
+                    val combinedBits = abs(int24L) or abs(int24R)
                     if (combinedBits != 0) {
                         for (b in 0 until 24) {
                             val shift = 22 - b
@@ -993,29 +1554,14 @@ class AudioCaptureService : Service() {
                     i += 2
                 }
 
-                // 1. Build True 24-Bit Histogram Display
                 var activeBitsTotal = 0
-                val sb1 = StringBuilder("Bits 01-08 (MSB):   [")
-                val sb2 = StringBuilder("Bits 09-16 (16Bit): [")
-                val sb3 = StringBuilder("Bits 17-24 (24Bit): [")
-
                 for (b in 0 until 24) {
                     val active = bitCounts[b] > (frames / 32)
+                    StreamState.bitActiveFlags[b] = active
                     if (active) activeBitsTotal++
-                    val ch = if (active) '█' else '·'
-                    when {
-                        b < 8 -> sb1.append(ch)
-                        b < 16 -> sb2.append(ch)
-                        else -> sb3.append(ch)
-                    }
                 }
-                sb1.append("]")
-                sb2.append("]")
-                sb3.append("]")
                 StreamState.activeBitCount = activeBitsTotal
-                StreamState.bitHistogramText = "$sb1\n$sb2\n$sb3"
 
-                // 2. Compute Analog VU Dials, Peak LEDs & Dynamic Crest Factor
                 val safeFrames = frames.coerceAtLeast(1)
                 val rmsL = sqrt(sumL / safeFrames)
                 val rmsR = sqrt(sumR / safeFrames)
@@ -1031,24 +1577,17 @@ class AudioCaptureService : Service() {
                 StreamState.rightDb = dbRmsR
                 StreamState.leftPeak = peakL > 0.65 || dbRmsL > -9f
                 StreamState.rightPeak = peakR > 0.65 || dbRmsR > -9f
-
                 StreamState.dbFs = dbRms
                 StreamState.crestFactorDb = (dbPeak - dbRms).coerceAtLeast(0.0)
                 StreamState.leftLevel = ((rmsL * 145).toInt()).coerceIn(0, 100)
                 StreamState.rightLevel = ((rmsR * 145).toInt()).coerceIn(0, 100)
                 StreamState.dataRateKbps = (lockedRate * 2 * 3) / 1000.0
 
-                // 3. Run 1024-Point FFT for High-Frequency Ultrasonic Spectrum
                 if (frameIdx == 1024) {
                     computeFft1024(fftReal, fftImag)
                     val binHz = lockedRate / 1024.0
-
-                    var eBass = 0.0
-                    var eMid = 0.0
-                    var eTreble = 0.0
-                    var eAir = 0.0
-                    var eLossless = 0.0
-                    var eUltrasonic = 0.0
+                    var eBass = 0.0; var eMid = 0.0; var eTreble = 0.0
+                    var eAir = 0.0; var eLossless = 0.0; var eUltrasonic = 0.0
 
                     for (bin in 1 until 512) {
                         val freq = bin * binHz
@@ -1072,52 +1611,47 @@ class AudioCaptureService : Service() {
 
                     val has24BitDetail = bitCounts[18] > 5 || bitCounts[20] > 5 || bitCounts[22] > 5
                     StreamState.qualityVerdict = when {
-                        maxRms < 0.0001 -> "SILENCE (Play a track in Apple Music)"
-                        StreamState.bandUltrasonic > 12 && has24BitDetail ->
-                            "HI-RES LOSSLESS VERIFIED (24-Bit Micro-Detail + >20kHz Ultrasonic Active!)"
-                        StreamState.bandLossless > 15 && has24BitDetail ->
-                            "TRUE 24-BIT LOSSLESS VERIFIED (Full 16-20kHz Air + Bits 17-24 Active!)"
-                        has24BitDetail ->
-                            "24-BIT PCM PRECISION ACTIVE (Clean Pre-DAC Stream, Soft Highs in Current Note)"
-                        else ->
-                            "16-BIT STANDARD / COMPRESSED (Lower 8 Bits Idle)"
+                        maxRms < 0.0001 -> "SILENCE / PLAY TRACK IN APPLE MUSIC"
+                        StreamState.bandLossless > 15 && has24BitDetail -> "TRUE 24-BIT LOSSLESS VERIFIED"
+                        has24BitDetail -> "24-BIT PCM HI-RES ACTIVE"
+                        else -> "16-BIT STANDARD STREAM"
                     }
                 }
 
                 val sbHex = StringBuilder()
-                for (b in 0 until minOf(9, pcm24Bytes.size)) {
+                for (b in 0 until minOf(6, pcm24Bytes.size)) {
                     sbHex.append(String.format("%02X ", pcm24Bytes[b]))
                 }
                 StreamState.hexPreview = sbHex.toString().trim()
 
-                // 5. Optional Wi-Fi TCP Stream to ESP32
                 if (StreamState.streamToEsp32) {
                     try {
                         if (socket == null || socket.isClosed || !socket.isConnected) {
-                            StreamState.statusText = "Connecting to ESP32 (${StreamState.espIp}:${StreamState.espPort})..."
                             socket = createWifiBoundSocket()
                             socket.tcpNoDelay = true
                             socket.connect(InetSocketAddress(StreamState.espIp, StreamState.espPort), 2000)
                             outStream = socket.getOutputStream()
-                            StreamState.statusText = "STREAMING 24-BIT HI-RES TO ESP32 (${lockedRate}Hz)"
                         }
                         outStream?.write(pcm24Bytes)
-                    } catch (e: Exception) {
-                        StreamState.statusText = "ESP32 Wi-Fi Waiting - Local Hi-Res Analyzer Active"
+                        StreamState.isEspConnected = true
+                        lastKeepAliveMs = nowMs
+                    } catch (_: Exception) {
+                        StreamState.isEspConnected = false
                         try { socket?.close() } catch (_: Exception) {}
                         socket = null
                         outStream = null
                     }
                 } else {
+                    StreamState.isEspConnected = false
                     if (socket != null) {
                         try { socket.close() } catch (_: Exception) {}
                         socket = null
                         outStream = null
                     }
-                    StreamState.statusText = "AUTO-MAX HI-RES PIPE: ${lockedRate} Hz / 24-Bit Pre-DAC"
                 }
             }
             try { socket?.close() } catch (_: Exception) {}
+            StreamState.isEspConnected = false
         }
     }
 
@@ -1184,6 +1718,7 @@ class AudioCaptureService : Service() {
 
     private fun cleanupAndStop() {
         StreamState.isRunning = false
+        StreamState.isEspConnected = false
         try { captureThread?.join(500) } catch (_: Exception) {}
         try {
             audioRecord?.stop()
@@ -1198,7 +1733,9 @@ class AudioCaptureService : Service() {
         StreamState.rightDb = -50f
         StreamState.leftPeak = false
         StreamState.rightPeak = false
-        StreamState.statusText = "STOPPED - Ready"
+        StreamState.activeBitCount = 0
+        for (b in 0 until 24) StreamState.bitActiveFlags[b] = false
+        StreamState.statusText = "IDLE"
         stopForeground(true)
         stopSelf()
     }
