@@ -532,7 +532,7 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
         )
 
         // 2.1 SUB LED turns ON whenever sub-bass hits a strong kick (> 50%)
-        val isSubKicking = StreamState.isRunning && smoothSub > 50f
+        val isSubKicking = StreamState.isRunning && smoothSub > 80f
 
         drawArcGauge(
             canvas, padX + mw + gap, topY, mw, mh,
@@ -540,10 +540,10 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
             labels = listOf(0f to "0", 0.25f to "25", 0.5f to "50", 0.75f to "75", 1.0f to "100"),
             bandColor = Color.parseColor("#D32F2F"),
             bandStartDeg = -76f, bandSweepDeg = 14f,
-            ledLabel = "2.1 SUB",
+            ledLabel = "SNAP",
             ledOn = isSubKicking,
             ledColor = Color.parseColor("#FF1744"),
-            title = "SUB-BASS PUNCH (%)"
+            title = "KICK / THUMP (60-120Hz)"
         )
     }
 
@@ -1889,7 +1889,7 @@ class AudioCaptureService : Service() {
                         val mag = sqrt(fftReal[bin] * fftReal[bin] + fftImag[bin] * fftImag[bin]) / 512.0
 
                         // SUB-BASS EXPANSION: Captures 20 Hz to 220 Hz kick/sub frequencies with high sensitivity
-                        if (freq in 20.0..220.0 && mag > eSub) eSub = mag
+                        if (freq in 60.0..120.0 && mag > eSub) eSub = mag
 
                         when {
                             freq < 250.0 -> if (mag > eBass) eBass = mag
