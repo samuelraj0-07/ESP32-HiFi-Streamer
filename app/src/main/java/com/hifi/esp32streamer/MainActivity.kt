@@ -453,7 +453,7 @@ class DualAnalogVuPanelView(context: Context) : View(context) {
 }
 
 // ================================================================================
-// PANEL 2: HIGH-RESOLUTION DYNAMIC CREST (dB) + ACTIVE SUB-BASS PUNCH (%)
+// PANEL 2: HIGH-RESOLUTION DYNAMIC CREST (dB) + HIGH-ACTION SUB-BASS PUNCH (%)
 // ================================================================================
 class CrestAndSubBassPanelView(context: Context) : View(context) {
     private var smoothCrest = 0f
@@ -490,11 +490,17 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
     }
 
     fun updateMeters() {
-        val tgtCrest = if (StreamState.isRunning) StreamState.crestFactorDb.toFloat().coerceIn(0f, 20f) else 0f
-        val tgtSub = if (StreamState.isRunning) StreamState.subBassPunch.toFloat().coerceIn(0f, 100f) else 0f
-        // Smooth responsive ballistics for Dynamic Crest so quiet passages and peaks dance actively!
-        smoothCrest += if (tgtCrest > smoothCrest) (tgtCrest - smoothCrest) * 0.35f else (tgtCrest - smoothCrest) * 0.15f
-        smoothSub += if (tgtSub > smoothSub) (tgtSub - smoothSub) * 0.50f else (tgtSub - smoothSub) * 0.20f
+        val tgtCrest = if (StreamState.isRunning && StreamState.dbFs > -80.0) {
+            StreamState.crestFactorDb.toFloat().coerceIn(0f, 20f)
+        } else 0f
+
+        val tgtSub = if (StreamState.isRunning && StreamState.dbFs > -80.0) {
+            StreamState.subBassPunch.toFloat().coerceIn(0f, 100f)
+        } else 0f
+
+        // Fast responsive ballistics for both needles
+        smoothCrest += if (tgtCrest > smoothCrest) (tgtCrest - smoothCrest) * 0.40f else (tgtCrest - smoothCrest) * 0.18f
+        smoothSub += if (tgtSub > smoothSub) (tgtSub - smoothSub) * 0.65f else (tgtSub - smoothSub) * 0.22f
         invalidate()
     }
 
@@ -510,6 +516,9 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
         val topY = h * 0.11f
         val mh = h * 0.62f
 
+        // FIX: Green "TX OK" LED turns ON *ONLY* when the needle is actually INSIDE the green zone (5 dB to 17 dB)!
+        val isInGreenZone = StreamState.isRunning && smoothCrest in 5.0f..17.0f
+
         drawArcGauge(
             canvas, padX, topY, mw, mh,
             normVal = smoothCrest / 20f,
@@ -517,10 +526,13 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
             bandColor = Color.parseColor("#43A047"),
             bandStartDeg = -104f, bandSweepDeg = 32f,
             ledLabel = "TX OK",
-            ledOn = StreamState.isEspConnected || (StreamState.isRunning && !StreamState.streamToEsp32),
+            ledOn = isInGreenZone,
             ledColor = Color.parseColor("#00E676"),
             title = "DYNAMIC CREST (dB)"
         )
+
+        // 2.1 SUB LED turns ON whenever sub-bass hits a strong kick (> 50%)
+        val isSubKicking = StreamState.isRunning && smoothSub > 50f
 
         drawArcGauge(
             canvas, padX + mw + gap, topY, mw, mh,
@@ -529,7 +541,7 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
             bandColor = Color.parseColor("#D32F2F"),
             bandStartDeg = -76f, bandSweepDeg = 14f,
             ledLabel = "2.1 SUB",
-            ledOn = StreamState.isRunning && smoothSub > 72f,
+            ledOn = isSubKicking,
             ledColor = Color.parseColor("#FF1744"),
             title = "SUB-BASS PUNCH (%)"
         )
@@ -716,7 +728,7 @@ class CutoffAndGainPanelView(context: Context, private val onGainChanged: (Float
         val h = height.toFloat()
         RackDraw.drawBrushedPanel(canvas, w, h, darkMode = false)
 
-        // LEFT SECTION: NEW RECESSED SPECTRAL CUTOFF METER (Replaces old LEDs)
+        // LEFT SECTION: NEW RECESSED SPECTRAL CUTOFF METER
         val meterLeft = w * 0.055f
         val meterRight = w * 0.445f
         val meterTop = h * 0.08f
@@ -763,8 +775,6 @@ class CutoffAndGainPanelView(context: Context, private val onGainChanged: (Float
         canvas.clipRect(face)
 
         val arcRect = RectF(pivotX - arcR, pivotY - arcR, pivotX + arcR, pivotY + arcR)
-        // Red Lossy Zone (14..20kHz = 60%), Green Lossless Zone (20..24kHz = 40%)
-        // Sweep from -28 deg to +28 deg (total 56 deg): -118 deg to -62 deg
         canvas.drawArc(arcRect, -118f, 33.6f, false, blackArc)
         canvas.drawArc(arcRect, -84.4f, 22.4f, false, greenArc)
 
@@ -1389,7 +1399,6 @@ class MainActivity : AppCompatActivity() {
             height = dp(98)
         })
 
-        // NEW PANEL 3: SPECTRAL CUTOFF METER (Replaces old LEDs) + OUTPUT GAIN THUMBWHEEL
         cutoffGainPanel = CutoffAndGainPanelView(this) { }
         rack.addView(cutoffGainPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.05f).apply {
             bottomMargin = dp(7)
@@ -1686,7 +1695,6 @@ class AudioCaptureService : Service() {
             var lastTickMs = SystemClock.elapsedRealtime()
             var lastKeepAliveMs = SystemClock.elapsedRealtime()
 
-            // Rolling short-term RMS baseline for high-resolution Dynamic Crest needle
             var longTermRms = 0.01
 
             while (StreamState.isRunning) {
@@ -1839,7 +1847,6 @@ class AudioCaptureService : Service() {
                 val maxRms = maxOf(rmsL, rmsR)
                 val peakAmp = maxOf(peakL, peakR)
 
-                // High-resolution Dynamic Crest Calculation (Instant Peak vs Rolling RMS baseline)
                 longTermRms += (maxRms - longTermRms) * 0.08
                 val dbRmsL = if (rmsL > 0.00001) (20.0 * log10(rmsL)).toFloat() else -50f
                 val dbRmsR = if (rmsR > 0.00001) (20.0 * log10(rmsR)).toFloat() else -50f
@@ -1853,7 +1860,6 @@ class AudioCaptureService : Service() {
                 StreamState.rightPeak = peakR > 0.65 || dbRmsR > -9f
                 StreamState.dbFs = dbRms
 
-                // High Dynamic Crest expansion: lets studio tracks swing expressively into 12-20 dB!
                 val rawCrest = if (maxRms > 0.0001) (dbPeak - dbBase).coerceAtLeast(0.0) else 0.0
                 StreamState.crestFactorDb = (rawCrest * 1.35).coerceIn(0.0, 20.0)
 
@@ -1869,9 +1875,9 @@ class AudioCaptureService : Service() {
 
                     // FORENSIC SPECTRAL SCANNER: Finds highest active frequency above noise floor (-115 dBFS)
                     var highestKhz = 14.0f
-                    for (bin in 511 downTo 298) { // 298 * 46.875Hz = 13.97 kHz
+                    for (bin in 511 downTo 298) {
                         val mag = sqrt(fftReal[bin] * fftReal[bin] + fftImag[bin] * fftImag[bin]) / 512.0
-                        if (mag > 0.0000018) { // Distinct musical transient above -115 dBFS
+                        if (mag > 0.0000018) {
                             highestKhz = (bin * binHz / 1000.0).toFloat().coerceIn(14.0f, 24.0f)
                             break
                         }
@@ -1881,7 +1887,10 @@ class AudioCaptureService : Service() {
                     for (bin in 1 until 512) {
                         val freq = bin * binHz
                         val mag = sqrt(fftReal[bin] * fftReal[bin] + fftImag[bin] * fftImag[bin]) / 512.0
-                        if (freq < 180.0 && mag > eSub) eSub = mag
+
+                        // SUB-BASS EXPANSION: Captures 20 Hz to 220 Hz kick/sub frequencies with high sensitivity
+                        if (freq in 20.0..220.0 && mag > eSub) eSub = mag
+
                         when {
                             freq < 250.0 -> if (mag > eBass) eBass = mag
                             freq < 4000.0 -> if (mag > eMid) eMid = mag
@@ -1892,13 +1901,14 @@ class AudioCaptureService : Service() {
                         }
                     }
 
-                    StreamState.subBassPunch = magToProgress(eSub, 82.0)
+                    // Boosted Sub-Bass Punch: +102 dB offset so the needle actively kicks between 30% and 90%!
+                    StreamState.subBassPunch = magToProgress(eSub, 102.0)
                     StreamState.bandBass = magToProgress(eBass, 85.0)
                     StreamState.bandMid = magToProgress(eMid, 90.0)
                     StreamState.bandTreble = magToProgress(eTreble, 100.0)
                     StreamState.bandAir = magToProgress(eAir, 110.0)
                     StreamState.bandLossless = magToProgress(eLossless, 115.0)
-                    StreamState.bandUltrasonic = magToProgress(eUltrasonic, 126.0) // Boosted for visible 20-24k Lossless shimmer!
+                    StreamState.bandUltrasonic = magToProgress(eUltrasonic, 126.0)
                 }
 
                 val sbHex = StringBuilder()
