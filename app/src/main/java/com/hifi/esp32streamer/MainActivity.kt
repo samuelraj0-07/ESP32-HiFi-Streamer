@@ -10,6 +10,7 @@ import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.*
+import android.net.wifi.WifiNetworkSpecifier
 import android.os.*
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
@@ -46,11 +47,10 @@ object StreamState {
     @Volatile var rightPeak = false
     @Volatile var dbFs = -100.0
     @Volatile var crestFactorDb = 0.0
-    @Volatile var subBassPunch = 0 // 0..100 (20Hz - 180Hz active kick meter)
+    @Volatile var subBassPunch = 0
     @Volatile var dataRateKbps = 0.0
     @Volatile var hexPreview = "00 00 00 00 00 00"
 
-    // 6-Band FFT Spectrum Analyzer Levels (0..100)
     @Volatile var bandBass = 0
     @Volatile var bandMid = 0
     @Volatile var bandTreble = 0
@@ -58,8 +58,7 @@ object StreamState {
     @Volatile var bandLossless = 0
     @Volatile var bandUltrasonic = 0
 
-    // Hardware Rack Controls
-    @Volatile var outputGainDb = 0.0f // -40.0 dB to 0.0 dB (Unity Max)
+    @Volatile var outputGainDb = 0.0f
     @Volatile var warmLampOn = true
     @Volatile var dimActive = false
     @Volatile var monoActive = false
@@ -68,6 +67,7 @@ object StreamState {
     @Volatile var streamToEsp32 = false
     @Volatile var isWifiReady = false
     @Volatile var isEspConnected = false
+    @Volatile var espWifiNetwork: Network? = null
     @Volatile var espIp = "192.168.4.1"
     @Volatile var espPort = 8888
     @Volatile var muteSpeaker = false
@@ -98,7 +98,68 @@ object StreamState {
 }
 
 // ================================================================================
-// HARDWARE GRAPHICS HELPER: Brushed Metal Panels, Rivets, Screws & Glow LEDs
+// APP-SCOPED WI-FI BRIDGE (Connects to ESP32 Without Breaking 5G Mobile Data!)
+// ================================================================================
+object EspWifiBridge {
+    private var activeCallback: ConnectivityManager.NetworkCallback? = null
+
+    fun connect(context: Context) {
+        val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+        // If phone already has a Wi-Fi network manually connected, check first, else request app-only Wi-Fi
+        disconnect(context)
+
+        val specifier = WifiNetworkSpecifier.Builder()
+            .setSsid("ESP32_HiFi_DAC")
+            .setWpa2Passphrase("hifiaudio123")
+            .build()
+
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .setNetworkSpecifier(specifier)
+            .build()
+
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                StreamState.espWifiNetwork = network
+                StreamState.isWifiReady = true
+            }
+
+            override fun onLost(network: Network) {
+                if (StreamState.espWifiNetwork == network) {
+                    StreamState.espWifiNetwork = null
+                    StreamState.isWifiReady = false
+                    StreamState.isEspConnected = false
+                }
+            }
+
+            override fun onUnavailable() {
+                StreamState.espWifiNetwork = null
+                StreamState.isWifiReady = false
+                StreamState.isEspConnected = false
+            }
+        }
+
+        activeCallback = cb
+        try {
+            cm.requestNetwork(request, cb)
+        } catch (_: Exception) {}
+    }
+
+    fun disconnect(context: Context) {
+        val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        activeCallback?.let {
+            try { cm.unregisterNetworkCallback(it) } catch (_: Exception) {}
+        }
+        activeCallback = null
+        StreamState.espWifiNetwork = null
+        StreamState.isEspConnected = false
+    }
+}
+
+// ================================================================================
+// HARDWARE GRAPHICS HELPER
 // ================================================================================
 object RackDraw {
     private val pFill = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -186,9 +247,6 @@ object RackDraw {
     }
 }
 
-// ================================================================================
-// OUTER RIVETED CAST-IRON RACK CHASSIS CONTAINER
-// ================================================================================
 class RivetedRackContainer(context: Context) : LinearLayout(context) {
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val railPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -237,9 +295,6 @@ class RivetedRackContainer(context: Context) : LinearLayout(context) {
     }
 }
 
-// ================================================================================
-// PANEL 1: DUAL VINTAGE ANALOG VU METERS (Clean Unclipped Scale -20..+3)
-// ================================================================================
 class DualAnalogVuPanelView(context: Context) : View(context) {
     private var smoothL = -34f
     private var smoothR = -34f
@@ -292,7 +347,7 @@ class DualAnalogVuPanelView(context: Context) : View(context) {
     private fun dbToAngle(db: Float): Float {
         val vu = (db + 10f).coerceIn(-20f, 3f)
         val norm = ((vu + 20f) / 23f).coerceIn(0f, 1f)
-        return -34f + norm * 68f // Tighter 68-deg sweep so -20 and +3 fit 100% inside dial!
+        return -34f + norm * 68f
     }
 
     fun updateMeters() {
@@ -343,7 +398,6 @@ class DualAnalogVuPanelView(context: Context) : View(context) {
         c.drawRoundRect(face, 5f, 5f, dialPaint)
         c.drawRoundRect(face, 5f, 5f, innerShadow)
 
-        // PEAK LED inside top-right corner of dial
         val ledX = face.right - face.width() * 0.10f
         val ledY = face.top + face.height() * 0.24f
         RackDraw.drawLed(c, ledX, ledY, (mw * 0.023f).coerceIn(4f, 7.5f), peak, Color.parseColor("#FF1744"), Color.parseColor("#5C1818"))
@@ -358,7 +412,6 @@ class DualAnalogVuPanelView(context: Context) : View(context) {
         c.clipRect(face)
 
         val arcRect = RectF(pivotX - arcR, pivotY - arcR, pivotX + arcR, pivotY + arcR)
-        // -34 deg to +34 deg around -90 deg = -124 deg to -56 deg
         c.drawArc(arcRect, -124f, 54.4f, false, blackArc)
         c.drawArc(arcRect, -69.6f, 13.6f, false, redArc)
 
@@ -398,9 +451,6 @@ class DualAnalogVuPanelView(context: Context) : View(context) {
     }
 }
 
-// ================================================================================
-// PANEL 2: DYNAMIC CREST (dB) + ACTIVE SUB-BASS PUNCH (20-180 Hz) METERS
-// ================================================================================
 class CrestAndSubBassPanelView(context: Context) : View(context) {
     private var smoothCrest = 0f
     private var smoothSub = 0f
@@ -526,7 +576,6 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
         bandPaint.color = bandColor
         c.drawArc(arcRect, bandStartDeg, bandSweepDeg, false, bandPaint)
 
-        // -28 deg to +28 deg around -90 deg = -118 deg to -62 deg (100% inside window)
         c.drawArc(arcRect, -118f, 56f, false, blackArc)
         textDark.textSize = (mh * 0.17f).coerceIn(9.5f, 15f)
         for ((norm, txt) in labels) {
@@ -548,9 +597,6 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
     }
 }
 
-// ================================================================================
-// PANEL 3: SIGNAL LOCK (With RX Status LED) + OUTPUT GAIN THUMBWHEEL
-// ================================================================================
 class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (Float) -> Unit) : View(context) {
     private val slotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#161719") }
     private val slotBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -626,7 +672,6 @@ class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (F
         val h = height.toFloat()
         RackDraw.drawBrushedPanel(canvas, w, h, darkMode = false)
 
-        // Left Section: SIGNAL LOCK (3 LEDs: CAPTURE, 24B LOCK, ESP32 RX)
         val leftCx = w * 0.245f
         headerPaint.textSize = (h * 0.145f).coerceIn(13f, 20f)
         canvas.drawText("SIGNAL & RX LOCK", leftCx, h * 0.21f, headerPaint)
@@ -648,7 +693,6 @@ class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (F
             if (locked24) Color.parseColor("#00E676") else Color.parseColor("#FFB300"),
             Color.parseColor("#402D10")
         )
-        // ESP32 Receiver Status LED: Green = Streaming to ESP32, Amber = Wi-Fi Standby, Red = No Wi-Fi
         val rxColor = when {
             StreamState.isEspConnected -> Color.parseColor("#00E676")
             StreamState.isWifiReady -> Color.parseColor("#FFB300")
@@ -668,7 +712,6 @@ class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (F
         amberText.textSize = (verdictSlot.height() * 0.45f).coerceIn(10f, 17f)
         canvas.drawText(StreamState.qualityVerdict.take(18), verdictSlot.centerX(), verdictSlot.centerY() + amberText.textSize * 0.35f, amberText)
 
-        // Right Section: OUTPUT GAIN Horizontal Knurled Thumbwheel
         val wheelCx = w * 0.65f
         canvas.drawText("OUTPUT GAIN", wheelCx, h * 0.21f, headerPaint)
 
@@ -694,7 +737,6 @@ class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (F
             canvas.drawText(marks[i], mx, yMark, subPaint)
         }
 
-        // UNITY LED & Digital dB Window
         val uCx = w * 0.895f
         canvas.drawText("UNITY", uCx, h * 0.34f, subPaint)
         val isUnity = StreamState.outputGainDb > -0.1f && !StreamState.dimActive
@@ -728,9 +770,6 @@ class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (F
     }
 }
 
-// ================================================================================
-// PANEL 4: FULL-WIDTH 24-BIT WORD MATRIX (3 x 8 Wide Amber Bricks + Hex)
-// ================================================================================
 class WordMatrix24FullPanelView(context: Context) : View(context) {
     private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#E0E0E0")
@@ -804,9 +843,6 @@ class WordMatrix24FullPanelView(context: Context) : View(context) {
     }
 }
 
-// ================================================================================
-// PANEL 5: FULL-WIDTH AF / ULTRASONIC SPECTRUM + [LAMP][DIM][MONO][PEAK] BUTTONS
-// ================================================================================
 class SpectrumFullPanelView(
     context: Context,
     private val onButtonAction: (String) -> Unit
@@ -881,7 +917,6 @@ class SpectrumFullPanelView(
         val availH = h * 0.74f
         val rowH = availH / 6f
 
-        // Vertical Green Master Column
         val vColX = w * 0.30f
         val vColW = w * 0.022f
         val vSegs = 20
@@ -894,7 +929,6 @@ class SpectrumFullPanelView(
             canvas.drawRoundRect(vColX, topY + s * vSegH + 1.5f, vColX + vColW, topY + (s + 1) * vSegH - 1.5f, 2f, 2f, segPaint)
         }
 
-        // 6 Wide Horizontal 14-Segment LED Bars
         val barLeft = w * 0.34f
         val barRight = w * 0.775f
         val hSegs = 14
@@ -939,7 +973,6 @@ class SpectrumFullPanelView(
             }
         }
 
-        // 4 Working Tactile Console Buttons on Right
         val btnStates = booleanArrayOf(StreamState.warmLampOn, StreamState.dimActive, StreamState.monoActive, StreamState.peakHoldActive)
         val btnLabels = arrayOf("[LAMP]", "[DIM]", "[MONO]", "[PEAK]")
         val btnLeft = w * 0.80f
@@ -967,9 +1000,6 @@ class SpectrumFullPanelView(
     }
 }
 
-// ================================================================================
-// PANEL 6: BOTTOM DECK (2 Rockers + Live Receiver Status + IP Odometer + Big TX ENGAGE)
-// ================================================================================
 class BottomControlDeckView(
     context: Context,
     private val onMuteToggle: (Boolean) -> Unit,
@@ -1053,7 +1083,6 @@ class BottomControlDeckView(
         val h = height.toFloat()
         RackDraw.drawBrushedPanel(canvas, w, h, darkMode = false)
 
-        // 1. Left Side: Two Vertical Rocker Switches
         val sw1Cx = w * 0.135f
         val sw2Cx = w * 0.325f
         val swW = w * 0.12f
@@ -1070,7 +1099,6 @@ class BottomControlDeckView(
         drawVerticalRocker(canvas, sw1Cx, swTop, swW, swBot - swTop, StreamState.muteSpeaker, Color.parseColor("#00E676"))
         drawVerticalRocker(canvas, sw2Cx, swTop, swW, swBot - swTop, StreamState.streamToEsp32, Color.parseColor("#FFB300"))
 
-        // 2. Right-Top: Live Receiver Status Strip + IP Odometer
         val rightL = w * 0.44f
         val rightR = w * 0.945f
 
@@ -1087,14 +1115,14 @@ class BottomControlDeckView(
         val rxStatusMsg = when {
             StreamState.isEspConnected -> "RX: ONLINE (${String.format("%.0f", StreamState.dataRateKbps)} KB/s)"
             StreamState.streamToEsp32 && StreamState.isWifiReady -> "RX: LINKING ${StreamState.espIp}..."
-            StreamState.isWifiReady -> "RX: STANDBY (WIFI READY)"
-            else -> "RX: OFFLINE (JOIN WIFI)"
+            StreamState.streamToEsp32 -> "RX: CONNECTING TO ESP32..."
+            StreamState.isWifiReady -> "RX: WIFI TUNNEL READY"
+            else -> "RX: OFF (FLIP RF TX ON)"
         }
         rxTextPaint.color = rxLedColor
         rxTextPaint.textSize = (rxBar.height() * 0.56f).coerceIn(10f, 16f)
         canvas.drawText(rxStatusMsg, rxBar.left + 32f, rxBar.centerY() + rxTextPaint.textSize * 0.35f, rxTextPaint)
 
-        // Odometer Drums (Tap to Edit IP)
         val winTop = h * 0.31f
         val winBot = h * 0.54f
         rectIp.set(rightL, winTop - 4f, rightR, winBot + 4f)
@@ -1117,7 +1145,6 @@ class BottomControlDeckView(
             canvas.drawText(chars[i].toString(), dRect.centerX(), dRect.centerY() + digitPaint.textSize * 0.35f, digitPaint)
         }
 
-        // 3. Right-Bottom: Large Wide Illuminated Backlit Glass Pushbutton ("TX ENGAGE" / "TX ACTIVE")
         rectEngage.set(rightL, h * 0.59f, rightR, h * 0.91f)
         btnFramePaint.shader = LinearGradient(0f, rectEngage.top, 0f, rectEngage.bottom, Color.parseColor("#6E7175"), Color.parseColor("#2B2D2F"), Shader.TileMode.CLAMP)
         canvas.drawRoundRect(rectEngage, 12f, 12f, btnFramePaint)
@@ -1161,9 +1188,6 @@ class BottomControlDeckView(
     }
 }
 
-// ================================================================================
-// MAIN ACTIVITY: Full-Screen Riveted Steel Studio Rack
-// ================================================================================
 class MainActivity : AppCompatActivity() {
 
     private lateinit var projectionManager: MediaProjectionManager
@@ -1180,16 +1204,19 @@ class MainActivity : AppCompatActivity() {
 
     private val uiUpdater = object : Runnable {
         override fun run() {
-            // Live Wi-Fi Link Check (even before TX Engage is tapped!)
-            var wifiUp = false
-            for (net in connectivityManager.allNetworks) {
-                val caps = connectivityManager.getNetworkCapabilities(net)
-                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                    wifiUp = true
-                    break
+            if (StreamState.espWifiNetwork == null) {
+                var wifiUp = false
+                for (net in connectivityManager.allNetworks) {
+                    val caps = connectivityManager.getNetworkCapabilities(net)
+                    if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                        wifiUp = true
+                        break
+                    }
                 }
+                StreamState.isWifiReady = wifiUp
+            } else {
+                StreamState.isWifiReady = true
             }
-            StreamState.isWifiReady = wifiUp
 
             vuPanel.updateMeters()
             crestSubPanel.updateMeters()
@@ -1249,35 +1276,30 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(18), dp(10), dp(18), dp(12))
         }
 
-        // Row 1: Dual Analog VU Meters
         vuPanel = DualAnalogVuPanelView(this)
         rack.addView(vuPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.45f).apply {
             bottomMargin = dp(7)
             height = dp(152)
         })
 
-        // Row 2: Dynamic Crest (dB) + Active Sub-Bass Punch (%)
         crestSubPanel = CrestAndSubBassPanelView(this)
         rack.addView(crestSubPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.92f).apply {
             bottomMargin = dp(7)
             height = dp(98)
         })
 
-        // Row 3: Signal & RX Lock + Output Gain Horizontal Thumbwheel
         lockGainPanel = SignalLockAndGainPanelView(this) { }
         rack.addView(lockGainPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.05f).apply {
             bottomMargin = dp(7)
             height = dp(110)
         })
 
-        // Row 4: Full-Width 24-Bit Word Matrix
         matrixPanel = WordMatrix24FullPanelView(this)
         rack.addView(matrixPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.95f).apply {
             bottomMargin = dp(7)
             height = dp(102)
         })
 
-        // Row 5: Full-Width AF / Ultrasonic Spectrum + Working Console Buttons
         spectrumPanel = SpectrumFullPanelView(this) { btn ->
             when (btn) {
                 "LAMP" -> StreamState.warmLampOn = !StreamState.warmLampOn
@@ -1291,14 +1313,19 @@ class MainActivity : AppCompatActivity() {
             height = dp(164)
         })
 
-        // Row 6: Bottom Deck (Rocker Switches + Live RX Status + IP Odometer + Big TX ENGAGE)
         bottomDeck = BottomControlDeckView(
             this,
             onMuteToggle = { checked ->
                 if (checked) StreamState.enforceSpeakerMuteLock(audioManager)
                 else StreamState.releaseSpeakerMuteLock(audioManager)
             },
-            onTxToggle = { },
+            onTxToggle = { checked ->
+                if (checked) {
+                    EspWifiBridge.connect(this)
+                } else {
+                    EspWifiBridge.disconnect(this)
+                }
+            },
             onEditIp = { showEditIpDialog() },
             onEngageTap = {
                 if (StreamState.isRunning) stopCaptureService()
@@ -1384,9 +1411,6 @@ class MainActivity : AppCompatActivity() {
     }
 }
 
-// ================================================================================
-// BACKGROUND AUDIO ENGINE: 24-Bit Pre-DAC + Gain/Dim/Mono + Sub-Bass Punch + Wi-Fi
-// ================================================================================
 class AudioCaptureService : Service() {
 
     private var mediaProjection: MediaProjection? = null
@@ -1768,13 +1792,17 @@ class AudioCaptureService : Service() {
                     try {
                         if (socket == null || socket.isClosed || !socket.isConnected) {
                             socket = createWifiBoundSocket()
-                            socket.tcpNoDelay = true
-                            socket.connect(InetSocketAddress(StreamState.espIp, StreamState.espPort), 2000)
-                            outStream = socket.getOutputStream()
+                            if (socket != null) {
+                                socket.tcpNoDelay = true
+                                socket.connect(InetSocketAddress(StreamState.espIp, StreamState.espPort), 2000)
+                                outStream = socket.getOutputStream()
+                            }
                         }
-                        outStream?.write(pcm24Bytes)
-                        StreamState.isEspConnected = true
-                        lastKeepAliveMs = nowMs
+                        if (outStream != null) {
+                            outStream.write(pcm24Bytes)
+                            StreamState.isEspConnected = true
+                            lastKeepAliveMs = nowMs
+                        }
                     } catch (_: Exception) {
                         StreamState.isEspConnected = false
                         try { socket?.close() } catch (_: Exception) {}
@@ -1845,7 +1873,12 @@ class AudioCaptureService : Service() {
         }
     }
 
-    private fun createWifiBoundSocket(): Socket {
+    private fun createWifiBoundSocket(): Socket? {
+        // 1. Prefer App-Scoped WifiNetworkSpecifier tunnel (Zero interference with 5G!)
+        StreamState.espWifiNetwork?.let { net ->
+            return net.socketFactory.createSocket()
+        }
+        // 2. Fallback if user manually connected in Settings
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         for (net in cm.allNetworks) {
             val caps = cm.getNetworkCapabilities(net)
@@ -1853,7 +1886,7 @@ class AudioCaptureService : Service() {
                 return net.socketFactory.createSocket()
             }
         }
-        return Socket()
+        return null
     }
 
     private fun cleanupAndStop() {
