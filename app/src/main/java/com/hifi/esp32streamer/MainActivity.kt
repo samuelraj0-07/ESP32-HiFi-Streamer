@@ -48,9 +48,11 @@ object StreamState {
     @Volatile var dbFs = -100.0
     @Volatile var crestFactorDb = 0.0
     @Volatile var subBassPunch = 0
+    @Volatile var spectralCutoffKhz = 14.0f // 14.0 kHz to 24.0 kHz live forensic cutoff
     @Volatile var dataRateKbps = 0.0
     @Volatile var hexPreview = "00 00 00 00 00 00"
 
+    // 6-Band FFT Spectrum Analyzer Levels (0..100)
     @Volatile var bandBass = 0
     @Volatile var bandMid = 0
     @Volatile var bandTreble = 0
@@ -58,6 +60,7 @@ object StreamState {
     @Volatile var bandLossless = 0
     @Volatile var bandUltrasonic = 0
 
+    // Hardware Rack Controls
     @Volatile var outputGainDb = 0.0f
     @Volatile var warmLampOn = true
     @Volatile var dimActive = false
@@ -105,8 +108,6 @@ object EspWifiBridge {
 
     fun connect(context: Context) {
         val cm = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-
-        // If phone already has a Wi-Fi network manually connected, check first, else request app-only Wi-Fi
         disconnect(context)
 
         val specifier = WifiNetworkSpecifier.Builder()
@@ -451,6 +452,9 @@ class DualAnalogVuPanelView(context: Context) : View(context) {
     }
 }
 
+// ================================================================================
+// PANEL 2: HIGH-RESOLUTION DYNAMIC CREST (dB) + ACTIVE SUB-BASS PUNCH (%)
+// ================================================================================
 class CrestAndSubBassPanelView(context: Context) : View(context) {
     private var smoothCrest = 0f
     private var smoothSub = 0f
@@ -488,7 +492,8 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
     fun updateMeters() {
         val tgtCrest = if (StreamState.isRunning) StreamState.crestFactorDb.toFloat().coerceIn(0f, 20f) else 0f
         val tgtSub = if (StreamState.isRunning) StreamState.subBassPunch.toFloat().coerceIn(0f, 100f) else 0f
-        smoothCrest += (tgtCrest - smoothCrest) * 0.22f
+        // Smooth responsive ballistics for Dynamic Crest so quiet passages and peaks dance actively!
+        smoothCrest += if (tgtCrest > smoothCrest) (tgtCrest - smoothCrest) * 0.35f else (tgtCrest - smoothCrest) * 0.15f
         smoothSub += if (tgtSub > smoothSub) (tgtSub - smoothSub) * 0.50f else (tgtSub - smoothSub) * 0.20f
         invalidate()
     }
@@ -597,12 +602,50 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
     }
 }
 
-class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (Float) -> Unit) : View(context) {
+// ================================================================================
+// PANEL 3: NEW RECESSED SPECTRAL CUTOFF METER (14-24 kHz) + OUTPUT GAIN THUMBWHEEL
+// ================================================================================
+class CutoffAndGainPanelView(context: Context, private val onGainChanged: (Float) -> Unit) : View(context) {
+    private var smoothCutoff = 14.0f
+
+    private val bezelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#1D1F21") }
+    private val innerShadow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+        color = Color.parseColor("#101112")
+    }
+    private val dialPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val blackArc = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.parseColor("#231D16")
+        strokeWidth = 2.0f
+    }
+    private val greenArc = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.parseColor("#2E7D32")
+        strokeWidth = 3.6f
+    }
+    private val textDark = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#231D16")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+    }
+    private val needlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#C62828")
+        style = Paint.Style.STROKE
+        strokeWidth = 2.8f
+        strokeCap = Paint.Cap.ROUND
+    }
     private val slotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#161719") }
     private val slotBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 2.5f
+        strokeWidth = 2.0f
         color = Color.parseColor("#54575A")
+    }
+    private val amberText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#FFB300")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
     private val wheelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val ribPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = 2.5f }
@@ -616,16 +659,17 @@ class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (F
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
     }
-    private val amberText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#FFB300")
-        textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-    }
 
     private var wheelRect = RectF()
     private var lastTouchX = 0f
     private var lastTapMs = 0L
     private var lastHapticStep = 0
+
+    fun updateCutoff() {
+        val tgt = if (StreamState.isRunning) StreamState.spectralCutoffKhz.coerceIn(14.0f, 24.0f) else 14.0f
+        smoothCutoff += (tgt - smoothCutoff) * 0.22f
+        invalidate()
+    }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.x < width * 0.45f) return false
@@ -672,47 +716,104 @@ class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (F
         val h = height.toFloat()
         RackDraw.drawBrushedPanel(canvas, w, h, darkMode = false)
 
-        val leftCx = w * 0.245f
-        headerPaint.textSize = (h * 0.145f).coerceIn(13f, 20f)
-        canvas.drawText("SIGNAL & RX LOCK", leftCx, h * 0.21f, headerPaint)
+        // LEFT SECTION: NEW RECESSED SPECTRAL CUTOFF METER (Replaces old LEDs)
+        val meterLeft = w * 0.055f
+        val meterRight = w * 0.445f
+        val meterTop = h * 0.08f
+        val meterBottom = h * 0.65f
+        val mw = meterRight - meterLeft
+        val mh = meterBottom - meterTop
+        val mcx = (meterLeft + meterRight) / 2f
 
-        val ledR = (h * 0.055f).coerceIn(4.5f, 8.5f)
-        val ledY = h * 0.37f
-        val x1 = w * 0.11f
-        val x2 = w * 0.245f
-        val x3 = w * 0.38f
+        val bezel = RectF(meterLeft, meterTop, meterRight, meterBottom)
+        canvas.drawRoundRect(bezel, 8f, 8f, bezelPaint)
 
-        RackDraw.drawLed(
-            canvas, x1, ledY, ledR, true,
-            if (StreamState.isRunning) Color.parseColor("#00E676") else Color.parseColor("#FF1744"),
-            Color.parseColor("#331212")
-        )
-        val locked24 = StreamState.isRunning && StreamState.activeBitCount >= 16
-        RackDraw.drawLed(
-            canvas, x2, ledY, ledR, StreamState.isRunning,
-            if (locked24) Color.parseColor("#00E676") else Color.parseColor("#FFB300"),
-            Color.parseColor("#402D10")
-        )
-        val rxColor = when {
-            StreamState.isEspConnected -> Color.parseColor("#00E676")
-            StreamState.isWifiReady -> Color.parseColor("#FFB300")
-            else -> Color.parseColor("#FF1744")
+        val inset = 5f
+        val face = RectF(bezel.left + inset, bezel.top + inset, bezel.right - inset, bezel.bottom - inset)
+        dialPaint.shader = if (StreamState.warmLampOn) {
+            RadialGradient(
+                mcx, face.bottom, face.width() * 0.7f,
+                intArrayOf(Color.parseColor("#FFF4D2"), Color.parseColor("#E6D4A6"), Color.parseColor("#C2AE7D")),
+                floatArrayOf(0f, 0.65f, 1f), Shader.TileMode.CLAMP
+            )
+        } else {
+            RadialGradient(
+                mcx, face.centerY(), face.width() * 0.7f,
+                intArrayOf(Color.parseColor("#F5F7F8"), Color.parseColor("#DCE0E3"), Color.parseColor("#B5BABE")),
+                floatArrayOf(0f, 0.65f, 1f), Shader.TileMode.CLAMP
+            )
         }
-        RackDraw.drawLed(canvas, x3, ledY, ledR, true, rxColor, Color.parseColor("#331212"))
+        canvas.drawRoundRect(face, 4f, 4f, dialPaint)
+        canvas.drawRoundRect(face, 4f, 4f, innerShadow)
 
-        subPaint.textSize = (h * 0.10f).coerceIn(9.5f, 14f)
-        canvas.drawText("CAP", x1, h * 0.55f, subPaint)
-        canvas.drawText("24-BIT", x2, h * 0.55f, subPaint)
-        canvas.drawText("ESP RX", x3, h * 0.55f, subPaint)
+        // Green LOSSLESS Indicator Lamp in top-right of dial
+        val isLosslessAudio = StreamState.isRunning && smoothCutoff >= 20.3f
+        val ledR = (mh * 0.08f).coerceIn(3.5f, 6.5f)
+        val ledX = face.right - face.width() * 0.12f
+        val ledY = face.top + face.height() * 0.28f
+        RackDraw.drawLed(canvas, ledX, ledY, ledR, isLosslessAudio, Color.parseColor("#00E676"), Color.parseColor("#183820"))
+        textDark.textSize = (mh * 0.13f).coerceIn(7.5f, 11f)
+        canvas.drawText("LOSSLESS", ledX, ledY + mh * 0.24f, textDark)
 
-        val verdictSlot = RectF(w * 0.055f, h * 0.64f, w * 0.435f, h * 0.87f)
-        canvas.drawRoundRect(verdictSlot, 6f, 6f, slotPaint)
-        canvas.drawRoundRect(verdictSlot, 6f, 6f, slotBorder)
+        val pivotX = mcx - mw * 0.02f
+        val pivotY = face.bottom + face.height() * 0.40f
+        val arcR = face.height() * 0.90f
 
-        amberText.textSize = (verdictSlot.height() * 0.45f).coerceIn(10f, 17f)
-        canvas.drawText(StreamState.qualityVerdict.take(18), verdictSlot.centerX(), verdictSlot.centerY() + amberText.textSize * 0.35f, amberText)
+        canvas.save()
+        canvas.clipRect(face)
 
+        val arcRect = RectF(pivotX - arcR, pivotY - arcR, pivotX + arcR, pivotY + arcR)
+        // Red Lossy Zone (14..20kHz = 60%), Green Lossless Zone (20..24kHz = 40%)
+        // Sweep from -28 deg to +28 deg (total 56 deg): -118 deg to -62 deg
+        canvas.drawArc(arcRect, -118f, 33.6f, false, blackArc)
+        canvas.drawArc(arcRect, -84.4f, 22.4f, false, greenArc)
+
+        val cutoffTicks = listOf(
+            0.0f to "14", 0.2f to "16", 0.4f to "18",
+            0.6f to "20k", 0.8f to "22", 1.0f to "24k"
+        )
+        textDark.textSize = (mh * 0.16f).coerceIn(8.5f, 13f)
+        for ((norm, txt) in cutoffTicks) {
+            val deg = -28f + norm * 56f
+            val rad = Math.toRadians((deg - 90f).toDouble())
+            val cosA = cos(rad).toFloat()
+            val sinA = sin(rad).toFloat()
+            canvas.drawLine(pivotX + arcR * 0.92f * cosA, pivotY + arcR * 0.92f * sinA, pivotX + arcR * 1.10f * cosA, pivotY + arcR * 1.10f * sinA, blackArc)
+            canvas.drawText(txt, pivotX + arcR * 1.25f * cosA, pivotY + arcR * 1.25f * sinA + textDark.textSize * 0.3f, textDark)
+        }
+
+        // Amber line at exact 20.0 kHz MP3 cutoff brickwall
+        val rad20 = Math.toRadians((-28f + 0.6f * 56f - 90f).toDouble())
+        needlePaint.color = Color.parseColor("#FFB300")
+        needlePaint.strokeWidth = 1.8f
+        canvas.drawLine(pivotX + arcR * 0.85f * cos(rad20).toFloat(), pivotY + arcR * 0.85f * sin(rad20).toFloat(), pivotX + arcR * 1.15f * cos(rad20).toFloat(), pivotY + arcR * 1.15f * sin(rad20).toFloat(), needlePaint)
+
+        // Swinging Forensic Needle
+        val normCutoff = ((smoothCutoff - 14.0f) / 10.0f).coerceIn(0.0f, 1.0f)
+        val angle = -28f + normCutoff * 56f
+        val nRad = Math.toRadians((angle - 90f).toDouble())
+        needlePaint.color = Color.parseColor("#D32F2F")
+        needlePaint.strokeWidth = 2.6f
+        canvas.drawLine(pivotX, pivotY, pivotX + arcR * 1.15f * cos(nRad).toFloat(), pivotY + arcR * 1.15f * sin(nRad).toFloat(), needlePaint)
+        canvas.restore()
+
+        // Readout Slot Below Meter
+        val slotRect = RectF(meterLeft, h * 0.68f, meterRight, h * 0.90f)
+        canvas.drawRoundRect(slotRect, 6f, 6f, slotPaint)
+        canvas.drawRoundRect(slotRect, 6f, 6f, slotBorder)
+
+        val cutoffVerdict = when {
+            !StreamState.isRunning || StreamState.dbFs <= -90.0 -> "IDLE / SILENCE"
+            smoothCutoff >= 20.4f -> "LOSSLESS [${String.format("%.1f", smoothCutoff)} kHz]"
+            smoothCutoff >= 19.5f -> "320k MP3 [${String.format("%.1f", smoothCutoff)} kHz]"
+            else -> "LOSSY [${String.format("%.1f", smoothCutoff)} kHz]"
+        }
+        amberText.textSize = (slotRect.height() * 0.44f).coerceIn(9.5f, 15f)
+        canvas.drawText(cutoffVerdict, slotRect.centerX(), slotRect.centerY() + amberText.textSize * 0.35f, amberText)
+
+        // RIGHT SECTION: OUTPUT GAIN Horizontal Knurled Thumbwheel
         val wheelCx = w * 0.65f
+        headerPaint.textSize = (h * 0.145f).coerceIn(13f, 20f)
         canvas.drawText("OUTPUT GAIN", wheelCx, h * 0.21f, headerPaint)
 
         wheelRect = RectF(w * 0.50f, h * 0.30f, w * 0.80f, h * 0.65f)
@@ -740,7 +841,7 @@ class SignalLockAndGainPanelView(context: Context, private val onGainChanged: (F
         val uCx = w * 0.895f
         canvas.drawText("UNITY", uCx, h * 0.34f, subPaint)
         val isUnity = StreamState.outputGainDb > -0.1f && !StreamState.dimActive
-        RackDraw.drawLed(canvas, uCx, h * 0.48f, ledR, isUnity, Color.parseColor("#00E676"), Color.parseColor("#193D24"))
+        RackDraw.drawLed(canvas, uCx, h * 0.48f, 5.5f, isUnity, Color.parseColor("#00E676"), Color.parseColor("#193D24"))
 
         val dbSlot = RectF(w * 0.84f, h * 0.62f, w * 0.955f, h * 0.85f)
         canvas.drawRoundRect(dbSlot, 5f, 5f, slotPaint)
@@ -910,7 +1011,7 @@ class SpectrumFullPanelView(
             "TREBLE (4-12k)" to StreamState.bandTreble,
             "AIR (12-16kHz)" to StreamState.bandAir,
             "LOSSLESS (16-20k)" to StreamState.bandLossless,
-            "ULTRA (20-48kHz)" to StreamState.bandUltrasonic
+            "HI-AIR (20-24kHz)" to StreamState.bandUltrasonic
         )
 
         val topY = h * 0.20f
@@ -1197,7 +1298,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var vuPanel: DualAnalogVuPanelView
     private lateinit var crestSubPanel: CrestAndSubBassPanelView
-    private lateinit var lockGainPanel: SignalLockAndGainPanelView
+    private lateinit var cutoffGainPanel: CutoffAndGainPanelView
     private lateinit var matrixPanel: WordMatrix24FullPanelView
     private lateinit var spectrumPanel: SpectrumFullPanelView
     private lateinit var bottomDeck: BottomControlDeckView
@@ -1220,7 +1321,7 @@ class MainActivity : AppCompatActivity() {
 
             vuPanel.updateMeters()
             crestSubPanel.updateMeters()
-            lockGainPanel.invalidate()
+            cutoffGainPanel.updateCutoff()
             matrixPanel.invalidate()
             spectrumPanel.invalidate()
             bottomDeck.invalidate()
@@ -1256,7 +1357,7 @@ class MainActivity : AppCompatActivity() {
                         StreamState.outputGainDb = (StreamState.outputGainDb - 2.0f).coerceAtLeast(-40.0f)
                     }
                 }
-                lockGainPanel.invalidate()
+                cutoffGainPanel.invalidate()
             }
             return true
         }
@@ -1288,8 +1389,9 @@ class MainActivity : AppCompatActivity() {
             height = dp(98)
         })
 
-        lockGainPanel = SignalLockAndGainPanelView(this) { }
-        rack.addView(lockGainPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.05f).apply {
+        // NEW PANEL 3: SPECTRAL CUTOFF METER (Replaces old LEDs) + OUTPUT GAIN THUMBWHEEL
+        cutoffGainPanel = CutoffAndGainPanelView(this) { }
+        rack.addView(cutoffGainPanel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.05f).apply {
             bottomMargin = dp(7)
             height = dp(110)
         })
@@ -1411,6 +1513,9 @@ class MainActivity : AppCompatActivity() {
     }
 }
 
+// ================================================================================
+// BACKGROUND AUDIO ENGINE: 24-Bit Pre-DAC + Spectral Cutoff Scanner + Dynamic Crest
+// ================================================================================
 class AudioCaptureService : Service() {
 
     private var mediaProjection: MediaProjection? = null
@@ -1581,6 +1686,9 @@ class AudioCaptureService : Service() {
             var lastTickMs = SystemClock.elapsedRealtime()
             var lastKeepAliveMs = SystemClock.elapsedRealtime()
 
+            // Rolling short-term RMS baseline for high-resolution Dynamic Crest needle
+            var longTermRms = 0.01
+
             while (StreamState.isRunning) {
                 if (StreamState.muteSpeaker) {
                     StreamState.enforceSpeakerMuteLock(audioManager)
@@ -1604,6 +1712,7 @@ class AudioCaptureService : Service() {
                         StreamState.dbFs = -100.0
                         StreamState.crestFactorDb = 0.0
                         StreamState.subBassPunch = 0
+                        StreamState.spectralCutoffKhz = 14.0f
                         StreamState.activeBitCount = 0
                         for (b in 0 until 24) StreamState.bitActiveFlags[b] = false
                         StreamState.hexPreview = "00 00 00 00 00 00"
@@ -1730,17 +1839,24 @@ class AudioCaptureService : Service() {
                 val maxRms = maxOf(rmsL, rmsR)
                 val peakAmp = maxOf(peakL, peakR)
 
+                // High-resolution Dynamic Crest Calculation (Instant Peak vs Rolling RMS baseline)
+                longTermRms += (maxRms - longTermRms) * 0.08
                 val dbRmsL = if (rmsL > 0.00001) (20.0 * log10(rmsL)).toFloat() else -50f
                 val dbRmsR = if (rmsR > 0.00001) (20.0 * log10(rmsR)).toFloat() else -50f
                 val dbRms = if (maxRms > 0.0000001) 20.0 * log10(maxRms) else -100.0
                 val dbPeak = if (peakAmp > 0.0000001) 20.0 * log10(peakAmp) else -100.0
+                val dbBase = if (longTermRms > 0.0000001) 20.0 * log10(longTermRms) else -100.0
 
                 StreamState.leftDb = dbRmsL
                 StreamState.rightDb = dbRmsR
                 StreamState.leftPeak = peakL > 0.65 || dbRmsL > -9f
                 StreamState.rightPeak = peakR > 0.65 || dbRmsR > -9f
                 StreamState.dbFs = dbRms
-                StreamState.crestFactorDb = if (maxRms > 0.0001) (dbPeak - dbRms).coerceAtLeast(0.0) else 0.0
+
+                // High Dynamic Crest expansion: lets studio tracks swing expressively into 12-20 dB!
+                val rawCrest = if (maxRms > 0.0001) (dbPeak - dbBase).coerceAtLeast(0.0) else 0.0
+                StreamState.crestFactorDb = (rawCrest * 1.35).coerceIn(0.0, 20.0)
+
                 StreamState.leftLevel = ((rmsL * 145).toInt()).coerceIn(0, 100)
                 StreamState.rightLevel = ((rmsR * 145).toInt()).coerceIn(0, 100)
                 StreamState.dataRateKbps = (lockedRate * 2 * 3) / 1000.0
@@ -1750,6 +1866,17 @@ class AudioCaptureService : Service() {
                     val binHz = lockedRate / 1024.0
                     var eSub = 0.0; var eBass = 0.0; var eMid = 0.0; var eTreble = 0.0
                     var eAir = 0.0; var eLossless = 0.0; var eUltrasonic = 0.0
+
+                    // FORENSIC SPECTRAL SCANNER: Finds highest active frequency above noise floor (-115 dBFS)
+                    var highestKhz = 14.0f
+                    for (bin in 511 downTo 298) { // 298 * 46.875Hz = 13.97 kHz
+                        val mag = sqrt(fftReal[bin] * fftReal[bin] + fftImag[bin] * fftImag[bin]) / 512.0
+                        if (mag > 0.0000018) { // Distinct musical transient above -115 dBFS
+                            highestKhz = (bin * binHz / 1000.0).toFloat().coerceIn(14.0f, 24.0f)
+                            break
+                        }
+                    }
+                    StreamState.spectralCutoffKhz = highestKhz
 
                     for (bin in 1 until 512) {
                         val freq = bin * binHz
@@ -1771,15 +1898,7 @@ class AudioCaptureService : Service() {
                     StreamState.bandTreble = magToProgress(eTreble, 100.0)
                     StreamState.bandAir = magToProgress(eAir, 110.0)
                     StreamState.bandLossless = magToProgress(eLossless, 115.0)
-                    StreamState.bandUltrasonic = magToProgress(eUltrasonic, 120.0)
-
-                    val has24BitDetail = bitCounts[18] > 5 || bitCounts[20] > 5 || bitCounts[22] > 5
-                    StreamState.qualityVerdict = when {
-                        maxRms < 0.0001 -> "SILENCE / MUTED"
-                        StreamState.bandLossless > 15 && has24BitDetail -> "24-BIT LOSSLESS"
-                        has24BitDetail -> "24-BIT HI-RES PCM"
-                        else -> "16-BIT STANDARD"
-                    }
+                    StreamState.bandUltrasonic = magToProgress(eUltrasonic, 126.0) // Boosted for visible 20-24k Lossless shimmer!
                 }
 
                 val sbHex = StringBuilder()
@@ -1874,11 +1993,9 @@ class AudioCaptureService : Service() {
     }
 
     private fun createWifiBoundSocket(): Socket? {
-        // 1. Prefer App-Scoped WifiNetworkSpecifier tunnel (Zero interference with 5G!)
         StreamState.espWifiNetwork?.let { net ->
             return net.socketFactory.createSocket()
         }
-        // 2. Fallback if user manually connected in Settings
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         for (net in cm.allNetworks) {
             val caps = cm.getNetworkCapabilities(net)
@@ -1908,6 +2025,7 @@ class AudioCaptureService : Service() {
         StreamState.rightPeak = false
         StreamState.crestFactorDb = 0.0
         StreamState.subBassPunch = 0
+        StreamState.spectralCutoffKhz = 14.0f
         StreamState.activeBitCount = 0
         for (b in 0 until 24) StreamState.bitActiveFlags[b] = false
         StreamState.qualityVerdict = "STANDBY / READY"
