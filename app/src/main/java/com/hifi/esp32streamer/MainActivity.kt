@@ -31,6 +31,13 @@ import kotlin.math.*
 // ================================================================================
 object StreamState {
     @Volatile var isRunning = false
+    @Volatile var appAlive = false
+    @Volatile var lastDataTransferMs = 0L
+    const val IDLE_TIMEOUT_MS = 15L * 60L * 1000L // 15 Minutes
+    const val ACTION_CLOSE_APP = "com.hifi.esp32streamer.ACTION_CLOSE_APP"
+    const val ACTION_REPOST_NOTIF = "com.hifi.esp32streamer.ACTION_REPOST_NOTIF"
+    const val NOTIF_ID = 1001
+
     @Volatile var statusText = "IDLE"
     @Volatile var sampleRate = 48000
     @Volatile var nativeMixerRate = 48000
@@ -97,6 +104,80 @@ object StreamState {
             am.setStreamVolume(AudioManager.STREAM_MUSIC, savedVolumeBeforeMute, 0)
             savedVolumeBeforeMute = -1
         }
+    }
+}
+
+// ================================================================================
+// PERSISTENT NON-CLOSEABLE NOTIFICATION HELPER
+// ================================================================================
+object RackNotificationHelper {
+    const val CHANNEL_ID = "HiFiStreamChannel"
+
+    fun buildNotification(context: Context, isTransmitting: Boolean): Notification {
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "HiFi Audio Streamer",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        nm.createNotificationChannel(channel)
+
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val openPending = PendingIntent.getActivity(
+            context, 2, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val repostIntent = Intent(StreamState.ACTION_REPOST_NOTIF).setPackage(context.packageName)
+        val repostPending = PendingIntent.getBroadcast(
+            context, 99, repostIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = Notification.Builder(context, CHANNEL_ID)
+            .setContentTitle(
+                if (isTransmitting) "ESP32 Hi-Fi Transmitter Active"
+                else "ESP32 Hi-Fi Console Running"
+            )
+            .setContentText(
+                if (isTransmitting) "24-Bit Pre-DAC PCM & Wi-Fi Link Running"
+                else "Standby — Ready for TX ENGAGE"
+            )
+            .setSmallIcon(
+                if (isTransmitting) android.R.drawable.ic_media_play
+                else android.R.drawable.stat_sys_headset
+            )
+            .setContentIntent(openPending)
+            .setDeleteIntent(repostPending)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setAutoCancel(false)
+
+        if (isTransmitting) {
+            val stopIntent = Intent(context, AudioCaptureService::class.java).apply { action = "ACTION_STOP" }
+            val stopPending = PendingIntent.getService(
+                context, 1, stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(android.R.drawable.ic_media_pause, "STOP", stopPending)
+        }
+
+        val notif = builder.build()
+        notif.flags = notif.flags or Notification.FLAG_NO_CLEAR or Notification.FLAG_ONGOING_EVENT
+        return notif
+    }
+
+    fun showCurrent(context: Context) {
+        if (!StreamState.appAlive && !StreamState.isRunning) return
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(StreamState.NOTIF_ID, buildNotification(context, isTransmitting = StreamState.isRunning))
+    }
+
+    fun cancel(context: Context) {
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.cancel(StreamState.NOTIF_ID)
     }
 }
 
@@ -498,7 +579,6 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
             StreamState.subBassPunch.toFloat().coerceIn(0f, 100f)
         } else 0f
 
-        // Fast responsive ballistics for both needles
         smoothCrest += if (tgtCrest > smoothCrest) (tgtCrest - smoothCrest) * 0.40f else (tgtCrest - smoothCrest) * 0.18f
         smoothSub += if (tgtSub > smoothSub) (tgtSub - smoothSub) * 0.65f else (tgtSub - smoothSub) * 0.22f
         invalidate()
@@ -516,7 +596,6 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
         val topY = h * 0.11f
         val mh = h * 0.62f
 
-        // FIX: Green "TX OK" LED turns ON *ONLY* when the needle is actually INSIDE the green zone (5 dB to 17 dB)!
         val isInGreenZone = StreamState.isRunning && smoothCrest in 5.0f..17.0f
 
         drawArcGauge(
@@ -531,7 +610,6 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
             title = "DYNAMIC CREST (dB)"
         )
 
-        // 2.1 SUB LED turns ON whenever sub-bass hits a strong kick (> 50%)
         val isSubKicking = StreamState.isRunning && smoothSub > 75f
 
         drawArcGauge(
@@ -615,7 +693,7 @@ class CrestAndSubBassPanelView(context: Context) : View(context) {
 }
 
 // ================================================================================
-// PANEL 3: NEW RECESSED SPECTRAL CUTOFF METER (14-24 kHz) + OUTPUT GAIN THUMBWHEEL
+// PANEL 3: RECESSED SPECTRAL CUTOFF METER (14-24 kHz) + OUTPUT GAIN THUMBWHEEL
 // ================================================================================
 class CutoffAndGainPanelView(context: Context, private val onGainChanged: (Float) -> Unit) : View(context) {
     private var smoothCutoff = 14.0f
@@ -728,7 +806,6 @@ class CutoffAndGainPanelView(context: Context, private val onGainChanged: (Float
         val h = height.toFloat()
         RackDraw.drawBrushedPanel(canvas, w, h, darkMode = false)
 
-        // LEFT SECTION: NEW RECESSED SPECTRAL CUTOFF METER
         val meterLeft = w * 0.055f
         val meterRight = w * 0.445f
         val meterTop = h * 0.08f
@@ -758,7 +835,6 @@ class CutoffAndGainPanelView(context: Context, private val onGainChanged: (Float
         canvas.drawRoundRect(face, 4f, 4f, dialPaint)
         canvas.drawRoundRect(face, 4f, 4f, innerShadow)
 
-        // Green LOSSLESS Indicator Lamp in top-right of dial
         val isLosslessAudio = StreamState.isRunning && smoothCutoff >= 20.3f
         val ledR = (mh * 0.08f).coerceIn(3.5f, 6.5f)
         val ledX = face.right - face.width() * 0.12f
@@ -792,13 +868,11 @@ class CutoffAndGainPanelView(context: Context, private val onGainChanged: (Float
             canvas.drawText(txt, pivotX + arcR * 1.25f * cosA, pivotY + arcR * 1.25f * sinA + textDark.textSize * 0.3f, textDark)
         }
 
-        // Amber line at exact 20.0 kHz MP3 cutoff brickwall
         val rad20 = Math.toRadians((-28f + 0.6f * 56f - 90f).toDouble())
         needlePaint.color = Color.parseColor("#FFB300")
         needlePaint.strokeWidth = 1.8f
         canvas.drawLine(pivotX + arcR * 0.85f * cos(rad20).toFloat(), pivotY + arcR * 0.85f * sin(rad20).toFloat(), pivotX + arcR * 1.15f * cos(rad20).toFloat(), pivotY + arcR * 1.15f * sin(rad20).toFloat(), needlePaint)
 
-        // Swinging Forensic Needle
         val normCutoff = ((smoothCutoff - 14.0f) / 10.0f).coerceIn(0.0f, 1.0f)
         val angle = -28f + normCutoff * 56f
         val nRad = Math.toRadians((angle - 90f).toDouble())
@@ -807,7 +881,6 @@ class CutoffAndGainPanelView(context: Context, private val onGainChanged: (Float
         canvas.drawLine(pivotX, pivotY, pivotX + arcR * 1.15f * cos(nRad).toFloat(), pivotY + arcR * 1.15f * sin(nRad).toFloat(), needlePaint)
         canvas.restore()
 
-        // Readout Slot Below Meter
         val slotRect = RectF(meterLeft, h * 0.68f, meterRight, h * 0.90f)
         canvas.drawRoundRect(slotRect, 6f, 6f, slotPaint)
         canvas.drawRoundRect(slotRect, 6f, 6f, slotBorder)
@@ -821,7 +894,6 @@ class CutoffAndGainPanelView(context: Context, private val onGainChanged: (Float
         amberText.textSize = (slotRect.height() * 0.44f).coerceIn(9.5f, 15f)
         canvas.drawText(cutoffVerdict, slotRect.centerX(), slotRect.centerY() + amberText.textSize * 0.35f, amberText)
 
-        // RIGHT SECTION: OUTPUT GAIN Horizontal Knurled Thumbwheel
         val wheelCx = w * 0.65f
         headerPaint.textSize = (h * 0.145f).coerceIn(13f, 20f)
         canvas.drawText("OUTPUT GAIN", wheelCx, h * 0.21f, headerPaint)
@@ -1313,6 +1385,33 @@ class MainActivity : AppCompatActivity() {
     private lateinit var spectrumPanel: SpectrumFullPanelView
     private lateinit var bottomDeck: BottomControlDeckView
 
+    private val systemEventReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                StreamState.ACTION_REPOST_NOTIF -> {
+                    if (StreamState.appAlive || StreamState.isRunning) {
+                        RackNotificationHelper.showCurrent(this@MainActivity)
+                    }
+                }
+                StreamState.ACTION_CLOSE_APP -> {
+                    forceCloseApp()
+                }
+            }
+        }
+    }
+
+    private val idleWatchdog = object : Runnable {
+        override fun run() {
+            if (!StreamState.appAlive) return
+            val elapsed = SystemClock.elapsedRealtime() - StreamState.lastDataTransferMs
+            if (elapsed >= StreamState.IDLE_TIMEOUT_MS) {
+                forceCloseApp()
+                return
+            }
+            uiHandler.postDelayed(this, 10_000L)
+        }
+    }
+
     private val uiUpdater = object : Runnable {
         override fun run() {
             if (StreamState.espWifiNetwork == null) {
@@ -1346,8 +1445,33 @@ class MainActivity : AppCompatActivity() {
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         StreamState.nativeMixerRate = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull() ?: 48000
 
+        StreamState.appAlive = true
+        StreamState.lastDataTransferMs = SystemClock.elapsedRealtime()
+
+        val filter = IntentFilter().apply {
+            addAction(StreamState.ACTION_REPOST_NOTIF)
+            addAction(StreamState.ACTION_CLOSE_APP)
+        }
+        ContextCompat.registerReceiver(
+            this, systemEventReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+
         buildRivetedRackUi()
         requestNeededPermissions()
+        RackNotificationHelper.showCurrent(this)
+        uiHandler.postDelayed(idleWatchdog, 10_000L)
+    }
+
+    private fun forceCloseApp() {
+        StreamState.appAlive = false
+        uiHandler.removeCallbacks(idleWatchdog)
+        uiHandler.removeCallbacks(uiUpdater)
+        if (StreamState.isRunning) {
+            stopCaptureService()
+        }
+        StreamState.releaseSpeakerMuteLock(audioManager)
+        RackNotificationHelper.cancel(this)
+        finishAndRemoveTask()
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -1483,6 +1607,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 101 && StreamState.appAlive) {
+            RackNotificationHelper.showCurrent(this)
+        }
+    }
+
     private fun startMediaProjectionRequest() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED) {
@@ -1519,6 +1652,16 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         uiHandler.removeCallbacks(uiUpdater)
+    }
+
+    override fun onDestroy() {
+        StreamState.appAlive = false
+        uiHandler.removeCallbacks(idleWatchdog)
+        try { unregisterReceiver(systemEventReceiver) } catch (_: Exception) {}
+        if (!StreamState.isRunning) {
+            RackNotificationHelper.cancel(this)
+        }
+        super.onDestroy()
     }
 }
 
@@ -1590,33 +1733,11 @@ class AudioCaptureService : Service() {
     }
 
     private fun startForegroundNotification() {
-        val channelId = "HiFiStreamChannel"
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val channel = NotificationChannel(channelId, "HiFi Audio Streamer", NotificationManager.IMPORTANCE_LOW)
-        nm.createNotificationChannel(channel)
-
-        val stopIntent = Intent(this, AudioCaptureService::class.java).apply { action = "ACTION_STOP" }
-        val stopPending = PendingIntent.getService(
-            this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val openIntent = Intent(this, MainActivity::class.java)
-        val openPending = PendingIntent.getActivity(
-            this, 2, openIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val notif = Notification.Builder(this, channelId)
-            .setContentTitle("ESP32 Hi-Fi Transmitter Active")
-            .setContentText("24-Bit Pre-DAC PCM & Wi-Fi Link Running")
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentIntent(openPending)
-            .addAction(android.R.drawable.ic_media_pause, "STOP", stopPending)
-            .setOngoing(true)
-            .build()
-
+        val notif = RackNotificationHelper.buildNotification(this, isTransmitting = true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1001, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            startForeground(StreamState.NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {
-            startForeground(1001, notif)
+            startForeground(StreamState.NOTIF_ID, notif)
         }
     }
 
@@ -1681,6 +1802,7 @@ class AudioCaptureService : Service() {
         StreamState.sampleRate = lockedRate
         StreamState.isRunning = true
         StreamState.statusText = "ACTIVE"
+        StreamState.lastDataTransferMs = SystemClock.elapsedRealtime()
 
         captureThread = thread(start = true, name = "HiResPreDacThread") {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
@@ -1694,6 +1816,7 @@ class AudioCaptureService : Service() {
             var zeroReadStreakMs = 0L
             var lastTickMs = SystemClock.elapsedRealtime()
             var lastKeepAliveMs = SystemClock.elapsedRealtime()
+            var timedOut = false
 
             var longTermRms = 0.01
 
@@ -1751,6 +1874,11 @@ class AudioCaptureService : Service() {
                             socket = null; outStream = null
                             StreamState.isEspConnected = false
                         }
+                    }
+
+                    if (nowMs - StreamState.lastDataTransferMs >= StreamState.IDLE_TIMEOUT_MS) {
+                        timedOut = true
+                        break
                     }
 
                     Thread.sleep(6)
@@ -1873,7 +2001,6 @@ class AudioCaptureService : Service() {
                     var eSub = 0.0; var eBass = 0.0; var eMid = 0.0; var eTreble = 0.0
                     var eAir = 0.0; var eLossless = 0.0; var eUltrasonic = 0.0
 
-                    // FORENSIC SPECTRAL SCANNER: Finds highest active frequency above noise floor (-115 dBFS)
                     var highestKhz = 14.0f
                     for (bin in 511 downTo 298) {
                         val mag = sqrt(fftReal[bin] * fftReal[bin] + fftImag[bin] * fftImag[bin]) / 512.0
@@ -1888,7 +2015,6 @@ class AudioCaptureService : Service() {
                         val freq = bin * binHz
                         val mag = sqrt(fftReal[bin] * fftReal[bin] + fftImag[bin] * fftImag[bin]) / 512.0
 
-                        // SUB-BASS EXPANSION: Captures 20 Hz to 220 Hz kick/sub frequencies with high sensitivity
                         if (freq in 90.0..110.0 && mag > eSub) eSub = mag
 
                         when {
@@ -1901,7 +2027,6 @@ class AudioCaptureService : Service() {
                         }
                     }
 
-                    // Boosted Sub-Bass Punch: +102 dB offset so the needle actively kicks between 30% and 90%!
                     StreamState.subBassPunch = magToProgress(eSub, 102.0)
                     StreamState.bandBass = magToProgress(eBass, 85.0)
                     StreamState.bandMid = magToProgress(eMid, 90.0)
@@ -1930,6 +2055,7 @@ class AudioCaptureService : Service() {
                         if (outStream != null) {
                             outStream.write(pcm24Bytes)
                             StreamState.isEspConnected = true
+                            StreamState.lastDataTransferMs = nowMs
                             lastKeepAliveMs = nowMs
                         }
                     } catch (_: Exception) {
@@ -1946,9 +2072,22 @@ class AudioCaptureService : Service() {
                         outStream = null
                     }
                 }
+
+                if (nowMs - StreamState.lastDataTransferMs >= StreamState.IDLE_TIMEOUT_MS) {
+                    timedOut = true
+                    break
+                }
             }
+
             try { socket?.close() } catch (_: Exception) {}
             StreamState.isEspConnected = false
+
+            if (timedOut) {
+                StreamState.isRunning = false
+                StreamState.appAlive = false
+                sendBroadcast(Intent(StreamState.ACTION_CLOSE_APP).setPackage(packageName))
+                Handler(Looper.getMainLooper()).post { cleanupAndStop() }
+            }
         }
     }
 
@@ -2040,7 +2179,13 @@ class AudioCaptureService : Service() {
         for (b in 0 until 24) StreamState.bitActiveFlags[b] = false
         StreamState.qualityVerdict = "STANDBY / READY"
         StreamState.statusText = "IDLE"
-        stopForeground(true)
+
+        stopForeground(STOP_FOREGROUND_DETACH)
+        if (StreamState.appAlive) {
+            RackNotificationHelper.showCurrent(this)
+        } else {
+            RackNotificationHelper.cancel(this)
+        }
         stopSelf()
     }
 
